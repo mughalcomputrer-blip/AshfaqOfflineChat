@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Ashfaq Offline Chat</string>
+
+    <string name="find_nearby">Find Nearby Phone</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="send">Send</string>
+    <string name="message_hint">Type a message</string>
+
+    <string name="status_not_connected">Not connected</string>
+    <string name="status_searching">Searching for a nearby phone...</string>
+    <string name="status_connecting">Connecting to %1$s...</string>
+    <string name="status_connected">Connected to %1$s</string>
+    <string name="status_disconnected">Disconnected. Tap Find Nearby Phone to reconnect.</string>
+
+    <string name="confirm_title">Connection request</string>
+    <string name="confirm_message">Connect with %1$s?\n\nThe code below must be the same on both phones:\n\n%2$s</string>
+    <string name="accept">Accept</string>
+    <string name="reject">Reject</string>
+
+    <string name="permissions_denied">Permission denied. The app cannot find nearby phones without it.</string>
+    <string name="not_connected_cannot_send">Not connected. Message not sent.</string>
+    <string name="error_generic">Error: %1$s</string>
+    <string name="error_hint">Make sure Bluetooth and Location are turned on, and that the other phone is also searching.</string>
+</resources>
