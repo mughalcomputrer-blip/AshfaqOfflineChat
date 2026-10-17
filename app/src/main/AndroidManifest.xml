@@ -12,7 +12,11 @@
     <!-- Bluetooth, for Android 12 and newer -->
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <!-- neverForLocation: app scan se location nahi nikalti,
+         is liye Android 13+ par location permission zaroori nahi -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
 
     <!-- Wi-Fi, used by Nearby for faster transfer (no internet needed) -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
