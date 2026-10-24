@@ -1,19 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="primary">#1B6B5A</color>
-    <color name="primary_dark">#134E42</color>
+    <color name="primary">#0B2B5B</color>
+    <color name="primary_dark">#071F42</color>
     <color name="on_primary">#FFFFFF</color>
+    <color name="accent">#12B5A5</color>
 
-    <color name="screen_background">#F2F5F4</color>
-    <color name="text_primary">#1C1F1E</color>
-    <color name="text_secondary">#5F6B68</color>
+    <color name="screen_background">#F2F5F9</color>
+    <color name="text_primary">#1C2733</color>
+    <color name="text_secondary">#5D6D7E</color>
 
-    <color name="bubble_sent">#1B6B5A</color>
+    <color name="bubble_sent">#12B5A5</color>
     <color name="bubble_sent_text">#FFFFFF</color>
     <color name="bubble_received">#FFFFFF</color>
-    <color name="bubble_received_text">#1C1F1E</color>
+    <color name="bubble_received_text">#1C2733</color>
+    <color name="bubble_received_stroke">#DFE6EE</color>
+
+    <color name="input_bar_background">#FFFFFF</color>
+    <color name="input_stroke">#D9E1EA</color>
 
     <color name="status_connected">#2E7D32</color>
-    <color name="status_idle">#5F6B68</color>
+    <color name="status_idle">#5D6D7E</color>
     <color name="status_error">#C62828</color>
 </resources>
