@@ -170,6 +170,14 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         setStatus(getString(R.string.status_disconnected), R.color.status_idle)
     }
 
+    override fun onReconnecting(attempt: Int, maxAttempts: Int) {
+        if (closing) return
+        setStatus(
+            getString(R.string.status_reconnecting, attempt, maxAttempts),
+            R.color.status_idle
+        )
+    }
+
     override fun onMessageReceived(text: String) {
         if (closing) return
         addMessage(ChatMessage(text = text, isSent = false))

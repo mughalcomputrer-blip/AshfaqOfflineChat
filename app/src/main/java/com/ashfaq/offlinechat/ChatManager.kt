@@ -2,6 +2,8 @@ package com.ashfaq.offlinechat
 
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.AdvertisingOptions
 import com.google.android.gms.nearby.connection.ConnectionInfo
@@ -15,6 +17,7 @@ import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
+import java.util.UUID
 
 class ChatManager(
     context: Context,
@@ -34,10 +37,14 @@ class ChatManager(
         fun onDisconnected()
         fun onMessageReceived(text: String)
         fun onError(message: String)
+
+        /** The connection dropped and an automatic retry is about to happen. */
+        fun onReconnecting(attempt: Int, maxAttempts: Int) {}
     }
 
     private val client = Nearby.getConnectionsClient(context.applicationContext)
     private val strategy = Strategy.P2P_POINT_TO_POINT
+    private val handler = Handler(Looper.getMainLooper())
 
     // Random suffix so two phones of the same model still have different names.
     private val localName: String = "${Build.MODEL}-${(1000..9999).random()}"
@@ -46,6 +53,15 @@ class ChatManager(
     private var pendingName: String = ""
     private var connectedEndpointId: String? = null
     private var connectedName: String = ""
+
+    // Auto-reconnect state. autoReconnect turns true after the first
+    // successful connection and stays true until the user taps Disconnect.
+    private var autoReconnect = false
+    private var reconnectAttempts = 0
+    private val reconnectRunnable = Runnable { start() }
+
+    // Ids of messages we already showed, so a repeated delivery is dropped.
+    private val seenMessageIds = LinkedHashSet<String>()
 
     fun isConnected(): Boolean = connectedEndpointId != null
 
@@ -70,19 +86,25 @@ class ChatManager(
     }
 
     fun disconnect() {
+        autoReconnect = false
+        reconnectAttempts = 0
         stopEverything()
         listener.onDisconnected()
     }
 
     fun sendMessage(text: String): Boolean {
         val endpointId = connectedEndpointId ?: return false
-        val payload = Payload.fromBytes(text.toByteArray(Charsets.UTF_8))
+        // Every message carries its own random id, so the other phone can
+        // spot and drop the same message if it is ever delivered twice.
+        val wireText = MESSAGE_ID_PREFIX + UUID.randomUUID().toString() + text
+        val payload = Payload.fromBytes(wireText.toByteArray(Charsets.UTF_8))
         client.sendPayload(endpointId, payload)
             .addOnFailureListener { e -> listener.onError(describe(e)) }
         return true
     }
 
     private fun stopEverything() {
+        handler.removeCallbacks(reconnectRunnable)
         connectedEndpointId = null
         pendingEndpointId = null
         client.stopAdvertising()
@@ -91,8 +113,28 @@ class ChatManager(
     }
 
     private fun fail(message: String) {
+        reconnectAttempts = 0
         stopEverything()
         listener.onError(message)
+    }
+
+    /**
+     * After the connection drops or a reconnect attempt fails, either wait a
+     * few seconds and search again, or give up after a few tries and report
+     * the normal disconnected state. It never loops forever.
+     */
+    private fun scheduleReconnectOrGiveUp() {
+        pendingEndpointId = null
+        if (!autoReconnect || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            reconnectAttempts = 0
+            stopEverything()
+            listener.onDisconnected()
+            return
+        }
+        reconnectAttempts++
+        listener.onReconnecting(reconnectAttempts, MAX_RECONNECT_ATTEMPTS)
+        handler.removeCallbacks(reconnectRunnable)
+        handler.postDelayed(reconnectRunnable, RECONNECT_DELAY_MS)
     }
 
     private fun describe(e: Exception): String = e.message ?: e.toString()
@@ -105,10 +147,16 @@ class ChatManager(
             // so the two phones do not request each other at once.
             if (localName <= info.endpointName) {
                 pendingEndpointId = endpointId
+                pendingName = info.endpointName
                 client.requestConnection(localName, endpointId, connectionCallback)
                     .addOnFailureListener { e ->
                         pendingEndpointId = null
-                        fail(describe(e))
+                        if (reconnectAttempts > 0) {
+                            // A reconnect attempt failed; try again or give up.
+                            scheduleReconnectOrGiveUp()
+                        } else {
+                            fail(describe(e))
+                        }
                     }
             }
         }
@@ -151,11 +199,17 @@ class ChatManager(
                 connectedEndpointId = endpointId
                 connectedName = pendingName
                 pendingEndpointId = null
+                autoReconnect = true
+                reconnectAttempts = 0
                 client.stopAdvertising()
                 client.stopDiscovery()
                 listener.onConnected(connectedName)
             } else if (code == ConnectionsStatusCodes.STATUS_CONNECTION_REJECTED) {
+                // The other person said no, so retrying makes no sense.
                 fail("The connection was rejected.")
+            } else if (reconnectAttempts > 0) {
+                // A reconnect attempt failed; try again or give up.
+                scheduleReconnectOrGiveUp()
             } else {
                 fail("Connection failed (code $code).")
             }
@@ -164,7 +218,11 @@ class ChatManager(
         override fun onDisconnected(endpointId: String) {
             if (endpointId == connectedEndpointId) {
                 connectedEndpointId = null
-                listener.onDisconnected()
+                if (autoReconnect) {
+                    scheduleReconnectOrGiveUp()
+                } else {
+                    listener.onDisconnected()
+                }
             }
         }
     }
@@ -175,18 +233,61 @@ class ChatManager(
             if (endpointId != connectedEndpointId) return
             if (payload.type != Payload.Type.BYTES) return
             val bytes = payload.asBytes() ?: return
-            listener.onMessageReceived(String(bytes, Charsets.UTF_8))
+            val (messageId, text) = unpackMessage(String(bytes, Charsets.UTF_8))
+            if (messageId != null && !rememberMessageId(messageId)) {
+                return // We already showed this message once.
+            }
+            listener.onMessageReceived(text)
         }
 
         override fun onPayloadTransferUpdate(
             endpointId: String,
             update: PayloadTransferUpdate
         ) {
-            // Text messages arrive in one piece, so nothing to track.
+            if (endpointId != connectedEndpointId) return
+            if (update.status == PayloadTransferUpdate.Status.FAILURE) {
+                listener.onError("A message could not be transferred.")
+            }
         }
+    }
+
+    /**
+     * Splits a received payload into its message id and the real text.
+     * New messages look like "#ID#" + a 36-char UUID + the text. Anything
+     * else (for example a plain message from an older app version) has no
+     * id and is shown as-is.
+     */
+    private fun unpackMessage(raw: String): Pair<String?, String> {
+        val idStart = MESSAGE_ID_PREFIX.length
+        val idEnd = idStart + MESSAGE_ID_LENGTH
+        if (raw.length >= idEnd && raw.startsWith(MESSAGE_ID_PREFIX)) {
+            val id = raw.substring(idStart, idEnd)
+            // A real UUID has dashes at fixed places; this check keeps
+            // normal text that happens to start with the prefix safe.
+            if (id[8] == '-' && id[13] == '-' && id[18] == '-' && id[23] == '-') {
+                return id to raw.substring(idEnd)
+            }
+        }
+        return null to raw
+    }
+
+    /** Remembers a message id. Returns false when the id was already seen. */
+    private fun rememberMessageId(id: String): Boolean {
+        if (!seenMessageIds.add(id)) return false
+        while (seenMessageIds.size > MAX_SEEN_MESSAGE_IDS) {
+            val oldest = seenMessageIds.iterator()
+            oldest.next()
+            oldest.remove()
+        }
+        return true
     }
 
     companion object {
         private const val SERVICE_ID = "com.ashfaq.offlinechat.v1"
+        private const val MAX_RECONNECT_ATTEMPTS = 3
+        private const val RECONNECT_DELAY_MS = 3_000L
+        private const val MESSAGE_ID_PREFIX = "#ID#"
+        private const val MESSAGE_ID_LENGTH = 36 // length of a UUID string
+        private const val MAX_SEEN_MESSAGE_IDS = 200
     }
 }

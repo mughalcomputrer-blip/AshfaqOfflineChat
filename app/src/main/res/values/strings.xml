@@ -10,6 +10,7 @@
 <string name="status_connected">Connected to %1$s</string>
 <string name="status_connected_already">Already connected. Tap Disconnect first.</string>
 <string name="status_disconnected">Disconnected. Tap Find Nearby Phone to reconnect.</string>
+<string name="status_reconnecting">Connection lost. Reconnecting (attempt %1$d of %2$d)...</string>
 
 <string name="confirm_title">Connection request</string>
 <string name="confirm_message">Connect with %1$s?\n\nThe code below must be the same on both phones:\n\n%2$s</string>
