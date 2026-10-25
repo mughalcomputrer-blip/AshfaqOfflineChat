@@ -100,6 +100,20 @@ object ChatHistoryStore {
             // so they survive a restart like the messages themselves.
             item.put("lid", message.localId)
             item.put("delivered", message.delivered)
+            // The id the other phones know this message by, so a
+            // reaction can still find it after a restart.
+            message.wireId?.let { item.put("wid", it) }
+            // The reactions on the message: emoji -> the names of the
+            // people who reacted with it. Only written when non-empty.
+            if (message.reactions.isNotEmpty()) {
+                val reactionsJson = JSONObject()
+                for ((emoji, names) in message.reactions) {
+                    val namesJson = JSONArray()
+                    for (name in names) namesJson.put(name)
+                    reactionsJson.put(emoji, namesJson)
+                }
+                item.put("reactions", reactionsJson)
+            }
             array.put(item)
         }
         return array.toString()
@@ -144,6 +158,36 @@ object ChatHistoryStore {
         } else {
             item.optString("qtext").takeIf { it.isNotEmpty() }
         }
+        // Older history files have no "wid" key either; those messages
+        // simply have no wire id (media announced none back then, and
+        // a text's id was never saved), so they cannot be reacted to.
+        val wireId = if (item.isNull("wid")) {
+            null
+        } else {
+            item.optString("wid").takeIf { it.isNotEmpty() }
+        }
+        // Older history files have no "reactions" key; their messages
+        // simply have no reactions. Empty name lists are dropped, so a
+        // stored reaction always names at least one person.
+        val reactions = mutableMapOf<String, MutableSet<String>>()
+        val reactionsJson = if (item.isNull("reactions")) {
+            null
+        } else {
+            item.optJSONObject("reactions")
+        }
+        if (reactionsJson != null) {
+            val emojiKeys = reactionsJson.keys()
+            while (emojiKeys.hasNext()) {
+                val emoji = emojiKeys.next()
+                val namesJson = reactionsJson.optJSONArray(emoji) ?: continue
+                val names = mutableSetOf<String>()
+                for (j in 0 until namesJson.length()) {
+                    namesJson.optString(j).takeIf { it.isNotEmpty() }
+                        ?.let { names.add(it) }
+                }
+                if (names.isNotEmpty()) reactions[emoji] = names
+            }
+        }
         // Older history files have no "lid"/"delivered" keys either;
         // those own messages then honestly show the single "sent" tick.
         // A voice, photo, video or file entry is only useful while its
@@ -180,7 +224,9 @@ object ChatHistoryStore {
             quotedSender = if (quotedText != null) quotedSender else null,
             quotedText = quotedText,
             localId = item.optLong("lid", 0L),
-            delivered = item.optBoolean("delivered", false)
+            delivered = item.optBoolean("delivered", false),
+            wireId = wireId,
+            reactions = reactions
         )
     }
 }

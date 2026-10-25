@@ -52,6 +52,18 @@ import java.util.UUID
  * dedupe, same "delivered" ticks, and the hub's word-for-word relay
  * carries it to the whole group — and is only recognised (and taken
  * out of the text stream) here, after the payload is unpacked.
+ *
+ * Reactions: every message has an id the other phones know it by —
+ * a text (or location) by the "#ID#" uuid inside its own payload, a
+ * voice, photo, video or file by a uuid announced in a tiny "#MID#"
+ * text just before its info text and file (paired per endpoint
+ * exactly like the "#RPLY#" quote). A reaction rides an ordinary
+ * text payload whose text is "#REACT#" + target id + "#" + emoji, so
+ * it gets the reactor's name from the "#FROM#" section, the usual
+ * dedupe, and the hub's word-for-word relay for free; it is taken
+ * out of the text stream here, like a location, and never shown as
+ * a chat text. The hub also applies a reaction it relays, so its
+ * own screen stays in step with the group.
  */
 class ChatManager(
     context: Context,
@@ -80,22 +92,45 @@ class ChatManager(
          * [senderName] is who originally wrote the message (null if
          * unknown). [quotedSender]/[quotedText] describe the message
          * this one replies to (both null when it is not a reply).
+         * [wireId] is the id other phones know this message by (its
+         * "#ID#" uuid), which reactions refer to; null only for
+         * payloads from very old app versions that carried no id.
          */
         fun onMessageReceived(
             text: String,
             senderName: String?,
             quotedSender: String?,
-            quotedText: String?
+            quotedText: String?,
+            wireId: String?
         )
 
         /**
          * A shared position arrived. [senderName] is who sent it
-         * (null if unknown), like for a text message.
+         * (null if unknown), like for a text message. [wireId] is
+         * the id other phones know the position's message by, like
+         * for a text message.
          */
         fun onLocationMessageReceived(
             latitude: Double,
             longitude: Double,
-            senderName: String?
+            senderName: String?,
+            wireId: String?
+        ) {}
+
+        /**
+         * Someone reacted to a message: [emoji] (one of
+         * [REACTION_EMOJIS]) on the message known by [targetWireId],
+         * from the person named [reactorName]. The reaction toggles:
+         * the same person sending the same emoji again takes it back,
+         * and a different emoji replaces their earlier one. The name
+         * is the reactor's stamped "#FROM#" name; it is null only
+         * when the payload carried no name at all, in which case the
+         * reaction cannot be attributed and is best ignored.
+         */
+        fun onReactionReceived(
+            targetWireId: String,
+            emoji: String,
+            reactorName: String?
         ) {}
 
         fun onError(message: String)
@@ -111,35 +146,46 @@ class ChatManager(
          */
         fun onMessageDelivered(localId: Long) {}
 
-        /** A voice message arrived; [filePath] points to our own copy of it. */
+        /**
+         * A voice message arrived; [filePath] points to our own copy
+         * of it. [wireId] is the id the sender announced for it in a
+         * "#MID#" text (null when the sender's app version announced
+         * none), which reactions refer to.
+         */
         fun onVoiceMessageReceived(
             filePath: String,
             durationSeconds: Int,
             senderName: String?,
             quotedSender: String?,
-            quotedText: String?
+            quotedText: String?,
+            wireId: String?
         ) {}
 
-        /** A photo arrived; [filePath] points to our own copy of it. */
+        /** A photo arrived; [filePath] points to our own copy of it.
+         *  [wireId] as for a voice message. */
         fun onPhotoMessageReceived(
             filePath: String,
             senderName: String?,
             quotedSender: String?,
-            quotedText: String?
+            quotedText: String?,
+            wireId: String?
         ) {}
 
-        /** A video arrived; [filePath] points to our own copy of it. */
+        /** A video arrived; [filePath] points to our own copy of it.
+         *  [wireId] as for a voice message. */
         fun onVideoMessageReceived(
             filePath: String,
             durationSeconds: Int,
             senderName: String?,
             quotedSender: String?,
-            quotedText: String?
+            quotedText: String?,
+            wireId: String?
         ) {}
 
         /**
          * A file arrived; [filePath] points to our own copy of it, saved
          * under its original name ([fileName]), [fileSizeBytes] big.
+         * [wireId] as for a voice message.
          */
         fun onFileMessageReceived(
             filePath: String,
@@ -147,7 +193,8 @@ class ChatManager(
             fileSizeBytes: Long,
             senderName: String?,
             quotedSender: String?,
-            quotedText: String?
+            quotedText: String?,
+            wireId: String?
         ) {}
     }
 
@@ -192,9 +239,11 @@ class ChatManager(
     /**
      * The display name we stamp into outgoing payloads, so the other
      * phones can show who sent a message. '#' is removed because it is
-     * the field separator of the payload formats.
+     * the field separator of the payload formats. Also used by the
+     * screen as the reactor name for this phone's own reactions, so a
+     * reaction means the same person on every phone.
      */
-    private fun wireSenderName(): String =
+    fun wireSenderName(): String =
         displayBaseName().replace('#', ' ').trim()
             .take(MAX_SENDER_NAME_LENGTH).trim()
 
@@ -300,6 +349,15 @@ class ChatManager(
     private data class PendingQuote(val sender: String, val text: String)
     private val pendingQuotes = mutableMapOf<String, PendingQuote>()
 
+    // The id a phone announced (in a small "#MID#" text) for the
+    // voice, photo, video or file it is about to send, so reactions
+    // can refer to that message later. Kept per sending endpoint and
+    // cleaned up exactly like [pendingQuotes]: used when the file's
+    // transfer finishes, dropped with the file info when the transfer
+    // fails or the phone leaves. A file that arrives with no "#MID#"
+    // (an older app version) simply has no id here.
+    private val pendingWireIds = mutableMapOf<String, String>()
+
     fun isConnected(): Boolean = connectedEndpoints.isNotEmpty()
 
     /**
@@ -373,12 +431,16 @@ class ChatManager(
      * When [quotedSender] and [quotedText] are both given, the message
      * is a reply and carries that quote inside the payload (after the
      * sender-name section), so the host's word-for-word relay keeps it.
+     * [wireId] is the id the payload carries (a fresh one is made when
+     * null); the caller passes one when it needs to know the id itself,
+     * so the chat row it shows can carry the same id reactions use.
      */
     fun sendMessage(
         text: String,
         localId: Long = 0,
         quotedSender: String? = null,
-        quotedText: String? = null
+        quotedText: String? = null,
+        wireId: String? = null
     ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
@@ -386,7 +448,7 @@ class ChatManager(
         // spot and drop the same message if it is ever delivered twice,
         // plus the sender's name, so group members can see who wrote it.
         // Old format "#ID#" + uuid + text still works on the other side.
-        val id = UUID.randomUUID().toString()
+        val id = wireId ?: UUID.randomUUID().toString()
         val name = wireSenderName()
         val wire = StringBuilder(MESSAGE_ID_PREFIX).append(id)
         if (name.isNotEmpty()) {
@@ -420,11 +482,29 @@ class ChatManager(
     fun sendLocationMessage(
         latitude: Double,
         longitude: Double,
-        localId: Long = 0
+        localId: Long = 0,
+        wireId: String? = null
     ): Boolean {
         val text = LOCATION_PREFIX +
             String.format(Locale.US, "%.6f,%.6f", latitude, longitude)
-        return sendMessage(text, localId)
+        return sendMessage(text, localId, wireId = wireId)
+    }
+
+    /**
+     * Reacts to a message: [emoji] (one of [REACTION_EMOJIS]) on the
+     * message the other phones know by [targetWireId]. The reaction is
+     * packed into a control text ("#REACT#" + target id + "#" + emoji)
+     * and sent through the ordinary text path ([sendMessage]), so it
+     * carries this phone's name in the "#FROM#" section (that name is
+     * who reacted), gets the usual dedupe, and the hub relays it word
+     * for word to the rest of the group; the receiving side recognises
+     * the control text in [parseReactionText] and never shows it as a
+     * chat text. Reactions toggle: the same person sending the same
+     * emoji for the same message again takes their reaction back.
+     */
+    fun sendReaction(targetWireId: String, emoji: String): Boolean {
+        if (targetWireId.isEmpty() || emoji !in REACTION_EMOJIS) return false
+        return sendMessage(REACT_PREFIX + targetWireId + "#" + emoji)
     }
 
     /**
@@ -437,7 +517,8 @@ class ChatManager(
         durationSeconds: Int,
         localId: Long = 0,
         quotedSender: String? = null,
-        quotedText: String? = null
+        quotedText: String? = null,
+        wireId: String? = null
     ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
@@ -450,7 +531,8 @@ class ChatManager(
         return sendInfoAndFile(
             targets, info, file,
             "The voice message could not be sent.", localId,
-            replyInfo(quotedSender, quotedText)
+            replyInfo(quotedSender, quotedText),
+            messageIdText(wireId)
         )
     }
 
@@ -463,7 +545,8 @@ class ChatManager(
         file: File,
         localId: Long = 0,
         quotedSender: String? = null,
-        quotedText: String? = null
+        quotedText: String? = null,
+        wireId: String? = null
     ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
@@ -476,7 +559,8 @@ class ChatManager(
         return sendInfoAndFile(
             targets, info, file,
             "The photo could not be sent.", localId,
-            replyInfo(quotedSender, quotedText)
+            replyInfo(quotedSender, quotedText),
+            messageIdText(wireId)
         )
     }
 
@@ -492,7 +576,8 @@ class ChatManager(
         file: File,
         localId: Long = 0,
         quotedSender: String? = null,
-        quotedText: String? = null
+        quotedText: String? = null,
+        wireId: String? = null
     ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
@@ -505,7 +590,8 @@ class ChatManager(
         return sendInfoAndFile(
             targets, info, file,
             "The video could not be sent.", localId,
-            replyInfo(quotedSender, quotedText)
+            replyInfo(quotedSender, quotedText),
+            messageIdText(wireId)
         )
     }
 
@@ -520,7 +606,8 @@ class ChatManager(
         file: File,
         localId: Long = 0,
         quotedSender: String? = null,
-        quotedText: String? = null
+        quotedText: String? = null,
+        wireId: String? = null
     ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
@@ -533,9 +620,20 @@ class ChatManager(
         return sendInfoAndFile(
             targets, info, file,
             "The file could not be sent.", localId,
-            replyInfo(quotedSender, quotedText)
+            replyInfo(quotedSender, quotedText),
+            messageIdText(wireId)
         )
     }
+
+    /**
+     * The tiny message-id text sent just before a voice, photo, video
+     * or file send: "#MID#" + the id the other phones will know this
+     * message by (so reactions can refer to it). Null when the send
+     * carries no id — the host's relays always re-announce the
+     * original id, so relayed files keep theirs.
+     */
+    private fun messageIdText(wireId: String?): String? =
+        wireId?.takeIf { it.isNotEmpty() }?.let { MEDIA_ID_PREFIX + it }
 
     /**
      * Sends one info text and then one file to all [targets]. Used for
@@ -550,6 +648,8 @@ class ChatManager(
      * goes first, before the info text, so the receiving side can hold
      * it next to the file info. It is only sent once the file payload
      * exists, so a send that cannot even start sends nothing at all.
+     * [messageIdText] (built by [messageIdText]) goes before even that:
+     * the id the receiving phones file the coming message under.
      */
     private fun sendInfoAndFile(
         targets: List<String>,
@@ -557,7 +657,8 @@ class ChatManager(
         file: File,
         errorMessage: String?,
         localId: Long = 0,
-        replyInfoText: String? = null
+        replyInfoText: String? = null,
+        messageIdText: String? = null
     ): Boolean {
         if (targets.isEmpty()) return false
         val filePayload = try {
@@ -567,6 +668,11 @@ class ChatManager(
             return false
         }
         if (localId != 0L) outgoingPayloads[filePayload.id] = localId
+        if (messageIdText != null) {
+            client.sendPayload(
+                targets, Payload.fromBytes(messageIdText.toByteArray(Charsets.UTF_8))
+            ).addOnFailureListener { e -> listener.onError(describe(e)) }
+        }
         if (replyInfoText != null) {
             client.sendPayload(
                 targets, Payload.fromBytes(replyInfoText.toByteArray(Charsets.UTF_8))
@@ -592,6 +698,7 @@ class ChatManager(
         filePayloadEndpoints.clear()
         pendingFiles.clear()
         pendingQuotes.clear()
+        pendingWireIds.clear()
         // Transfers that never finished will never report now; their
         // messages simply keep the single "sent" tick.
         outgoingPayloads.clear()
@@ -814,10 +921,11 @@ class ChatManager(
             if (!connectedEndpoints.containsKey(endpointId)) return
             connectedEndpoints.remove(endpointId)
             // The phone is gone, so the info about a file it was sending,
-            // any quote waiting for that file, and any half-arrived file
-            // of it are stale now.
+            // any quote waiting for that file, any message id waiting for
+            // that file, and any half-arrived file of it are stale now.
             pendingFiles.remove(endpointId)
             pendingQuotes.remove(endpointId)
+            pendingWireIds.remove(endpointId)
             val iterator = filePayloadEndpoints.entries.iterator()
             while (iterator.hasNext()) {
                 val entry = iterator.next()
@@ -856,6 +964,18 @@ class ChatManager(
                 Payload.Type.BYTES -> {
                     val bytes = payload.asBytes() ?: return
                     val raw = String(bytes, Charsets.UTF_8)
+                    if (raw.startsWith(MEDIA_ID_PREFIX)) {
+                        // The id of the voice, photo, video or file
+                        // this phone is about to send, so reactions can
+                        // refer to that message later. It is held until
+                        // the file's transfer finishes, like the quote.
+                        // A malformed one is simply dropped — it is a
+                        // control text, not a chat message.
+                        parseMessageIdInfo(raw)?.let {
+                            pendingWireIds[endpointId] = it
+                        }
+                        return
+                    }
                     if (raw.startsWith(REPLY_PREFIX)) {
                         // The quote belonging to the voice, photo or
                         // file this phone is about to send. It is held
@@ -908,15 +1028,24 @@ class ChatManager(
                     // prefix but does not parse is a control text gone
                     // wrong and is dropped silently — but relayed below
                     // like everything else, so the group stays in step.
+                    // A reaction ("#REACT#" control text) is handled the
+                    // same way: reported to the listener, never shown.
                     val location = parseLocationText(message.text)
+                    val reaction = parseReactionText(message.text)
                     when {
+                        reaction != null -> listener.onReactionReceived(
+                            reaction.first, reaction.second, message.senderName
+                        )
                         location != null -> listener.onLocationMessageReceived(
-                            location.first, location.second, message.senderName
+                            location.first, location.second, message.senderName,
+                            message.id
                         )
                         message.text.startsWith(LOCATION_PREFIX) -> Unit
+                        message.text.startsWith(REACT_PREFIX) -> Unit
                         else -> listener.onMessageReceived(
                             message.text, message.senderName,
-                            message.quotedSender, message.quotedText
+                            message.quotedSender, message.quotedText,
+                            message.id
                         )
                     }
                     if (role == Role.HUB) {
@@ -950,9 +1079,10 @@ class ChatManager(
                 outgoingPayloads.remove(update.payloadId)
                 if (wasIncoming) {
                     // The file is gone, so its info message — and any
-                    // quote waiting for it — are stale too.
+                    // quote or message id waiting for it — are stale too.
                     pendingFiles.remove(endpointId)
                     pendingQuotes.remove(endpointId)
+                    pendingWireIds.remove(endpointId)
                 }
                 listener.onError("A message could not be transferred.")
             } else if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
@@ -970,9 +1100,12 @@ class ChatManager(
                     // The info message said what kind of file this is. No
                     // info (or a lost one) keeps the old behavior: voice.
                     // A quote that was sent just before the file belongs
-                    // to this message and is used up now.
+                    // to this message and is used up now; so is the id
+                    // that was announced for it, which the message takes
+                    // as its own (and the relay below re-announces).
                     val info = pendingFiles.remove(endpointId)
                     val quote = pendingQuotes.remove(endpointId)
+                    val wireId = pendingWireIds.remove(endpointId)
                     when (info?.kind ?: IncomingFileKind.VOICE) {
                         IncomingFileKind.VOICE -> {
                             val dest = saveReceivedVoiceFile(filePayload) ?: return
@@ -980,11 +1113,12 @@ class ChatManager(
                                 ?: fileDurationSeconds(dest)
                             listener.onVoiceMessageReceived(
                                 dest.absolutePath, duration, info?.senderName,
-                                quote?.sender, quote?.text
+                                quote?.sender, quote?.text, wireId
                             )
                             if (role == Role.HUB) {
                                 relayVoiceFile(
-                                    dest, duration, info?.senderName, endpointId, quote
+                                    dest, duration, info?.senderName, endpointId,
+                                    quote, wireId
                                 )
                             }
                         }
@@ -992,20 +1126,22 @@ class ChatManager(
                             val dest = saveReceivedPhotoFile(filePayload) ?: return
                             listener.onPhotoMessageReceived(
                                 dest.absolutePath, info?.senderName,
-                                quote?.sender, quote?.text
+                                quote?.sender, quote?.text, wireId
                             )
                             if (role == Role.HUB) {
-                                relayPhotoFile(dest, info?.senderName, endpointId, quote)
+                                relayPhotoFile(
+                                    dest, info?.senderName, endpointId, quote, wireId
+                                )
                             }
                         }
                         IncomingFileKind.FILE -> {
                             val dest = saveReceivedFile(filePayload, info?.fileName) ?: return
                             listener.onFileMessageReceived(
                                 dest.absolutePath, dest.name, dest.length(),
-                                info?.senderName, quote?.sender, quote?.text
+                                info?.senderName, quote?.sender, quote?.text, wireId
                             )
                             if (role == Role.HUB) {
-                                relayFile(dest, info?.senderName, endpointId, quote)
+                                relayFile(dest, info?.senderName, endpointId, quote, wireId)
                             }
                         }
                         IncomingFileKind.VIDEO -> {
@@ -1015,10 +1151,12 @@ class ChatManager(
                             val duration = fileDurationSeconds(dest)
                             listener.onVideoMessageReceived(
                                 dest.absolutePath, duration, info?.senderName,
-                                quote?.sender, quote?.text
+                                quote?.sender, quote?.text, wireId
                             )
                             if (role == Role.HUB) {
-                                relayVideoFile(dest, info?.senderName, endpointId, quote)
+                                relayVideoFile(
+                                    dest, info?.senderName, endpointId, quote, wireId
+                                )
                             }
                         }
                     }
@@ -1037,7 +1175,8 @@ class ChatManager(
         durationSeconds: Int,
         senderName: String?,
         exceptEndpointId: String,
-        quote: PendingQuote? = null
+        quote: PendingQuote? = null,
+        wireId: String? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -1048,7 +1187,8 @@ class ChatManager(
         }
         sendInfoAndFile(
             targets, info, file, null, 0,
-            replyInfo(quote?.sender, quote?.text)
+            replyInfo(quote?.sender, quote?.text),
+            messageIdText(wireId)
         )
     }
 
@@ -1056,7 +1196,8 @@ class ChatManager(
         file: File,
         senderName: String?,
         exceptEndpointId: String,
-        quote: PendingQuote? = null
+        quote: PendingQuote? = null,
+        wireId: String? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -1067,7 +1208,8 @@ class ChatManager(
         }
         sendInfoAndFile(
             targets, info, file, null, 0,
-            replyInfo(quote?.sender, quote?.text)
+            replyInfo(quote?.sender, quote?.text),
+            messageIdText(wireId)
         )
     }
 
@@ -1075,7 +1217,8 @@ class ChatManager(
         file: File,
         senderName: String?,
         exceptEndpointId: String,
-        quote: PendingQuote? = null
+        quote: PendingQuote? = null,
+        wireId: String? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -1086,7 +1229,8 @@ class ChatManager(
         }
         sendInfoAndFile(
             targets, info, file, null, 0,
-            replyInfo(quote?.sender, quote?.text)
+            replyInfo(quote?.sender, quote?.text),
+            messageIdText(wireId)
         )
     }
 
@@ -1094,7 +1238,8 @@ class ChatManager(
         file: File,
         senderName: String?,
         exceptEndpointId: String,
-        quote: PendingQuote? = null
+        quote: PendingQuote? = null,
+        wireId: String? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -1105,8 +1250,48 @@ class ChatManager(
         }
         sendInfoAndFile(
             targets, info, file, null, 0,
-            replyInfo(quote?.sender, quote?.text)
+            replyInfo(quote?.sender, quote?.text),
+            messageIdText(wireId)
         )
+    }
+
+    /**
+     * Reads a message-id info text: "#MID#" + a UUID. Only the exact
+     * UUID shape is accepted (36 characters, dashes where a UUID has
+     * them — the same check [unpackMessage] makes), so a typed chat
+     * text that happens to start with the prefix can never be taken
+     * for one; null then, and the text is dropped as a control text
+     * gone wrong, never shown as a chat message.
+     */
+    private fun parseMessageIdInfo(raw: String): String? {
+        val rest = raw.substring(MEDIA_ID_PREFIX.length)
+        if (rest.length != MESSAGE_ID_LENGTH) return null
+        if (rest[8] != '-' || rest[13] != '-' || rest[18] != '-' ||
+            rest[23] != '-'
+        ) {
+            return null
+        }
+        return rest
+    }
+
+    /**
+     * Reads a reaction control text: "#REACT#" + target message id +
+     * "#" + emoji (split at the FIRST '#'; ids never contain one). The
+     * emoji must be exactly one of [REACTION_EMOJIS] with nothing after
+     * it, and the target must be non-empty — anything else is null, so
+     * a typed chat text can never be mistaken for a reaction, and a
+     * damaged control text is dropped silently (but still relayed by
+     * the hub, like every control text).
+     */
+    private fun parseReactionText(text: String): Pair<String, String>? {
+        if (!text.startsWith(REACT_PREFIX)) return null
+        val rest = text.substring(REACT_PREFIX.length)
+        val separator = rest.indexOf('#')
+        if (separator <= 0) return null
+        val target = rest.substring(0, separator)
+        val emoji = rest.substring(separator + 1)
+        if (emoji !in REACTION_EMOJIS) return null
+        return target to emoji
     }
 
     /**
@@ -1480,6 +1665,24 @@ class ChatManager(
         // A shared position, packed inside an ordinary text payload:
         // "#LOC#" + latitude + "," + longitude (see sendLocationMessage).
         private const val LOCATION_PREFIX = "#LOC#"
+        // The id of a voice, photo, video or file message, announced
+        // in its own tiny text just before the info text: "#MID#" +
+        // a UUID (see messageIdText / parseMessageIdInfo).
+        private const val MEDIA_ID_PREFIX = "#MID#"
+        // A reaction, packed inside an ordinary text payload:
+        // "#REACT#" + target message id + "#" + emoji
+        // (see sendReaction / parseReactionText).
+        private const val REACT_PREFIX = "#REACT#"
+
+        /**
+         * The emojis a message can be reacted with, in the order the
+         * long-press menu shows them. A reaction carrying anything
+         * else is not a reaction (see [parseReactionText]). Note the
+         * heart is two UTF-16 code units (a heart plus a variation
+         * selector); matching is by exact string everywhere.
+         */
+        val REACTION_EMOJIS: List<String> =
+            listOf("❤️", "😂", "👍", "😮", "😢", "🙏")
         private const val MAX_FILE_NAME_LENGTH = 128
 
         /** How many members ("spokes") the host can have: a group is at

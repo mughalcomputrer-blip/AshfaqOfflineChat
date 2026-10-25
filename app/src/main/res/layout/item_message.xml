@@ -229,6 +229,15 @@
             android:textColor="@color/bubble_received_text"
             android:textSize="16sp" />
 
+        <TextView
+            android:id="@+id/reactionsText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="3dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp"
+            android:visibility="gone" />
+
         <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"

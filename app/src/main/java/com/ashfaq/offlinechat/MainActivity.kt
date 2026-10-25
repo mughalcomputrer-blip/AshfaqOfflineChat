@@ -38,6 +38,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
 import java.io.File
+import java.util.UUID
 
 class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
@@ -177,7 +178,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         val buttonCancelQuote: ImageButton = findViewById(R.id.buttonCancelQuote)
 
         adapter = MessageAdapter()
-        adapter.onReplyRequested = { message -> showReplyDialog(message) }
+        adapter.onMessageMenuRequested = { message -> showMessageMenu(message) }
         recyclerMessages.layoutManager = LinearLayoutManager(this)
         recyclerMessages.adapter = adapter
 
@@ -306,8 +307,13 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         val text = editMessage.text.toString().trim()
         if (text.isEmpty()) return
         val localId = nextLocalId++
+        // The id the other phones will know this message by, decided
+        // here so the chat row below can carry the same id (reactions
+        // refer to it).
+        val wireId = UUID.randomUUID().toString()
         if (!chatManager.sendMessage(
-                text, localId, pendingQuotedSender, pendingQuotedText
+                text, localId, pendingQuotedSender, pendingQuotedText,
+                wireId = wireId
             )
         ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
@@ -319,23 +325,59 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 isSent = true,
                 localId = localId,
                 quotedSender = pendingQuotedSender,
-                quotedText = pendingQuotedText
+                quotedText = pendingQuotedText,
+                wireId = wireId
             )
         )
         editMessage.text.clear()
         clearPendingQuote()
     }
 
-    // ---------- Replies ----------
+    // ---------- Replies & reactions ----------
 
-    /** The little menu shown when a message is long-pressed. */
-    private fun showReplyDialog(message: ChatMessage) {
+    /**
+     * The menu shown when a message is long-pressed: the six reaction
+     * emojis, then "Reply". A message without a wire id (media saved
+     * by an older app version, which announced none) cannot be
+     * reacted to — the other phones would not know which message the
+     * reaction means — so it only offers "Reply".
+     */
+    private fun showMessageMenu(message: ChatMessage) {
         if (closing) return
+        if (message.wireId == null) {
+            AlertDialog.Builder(this)
+                .setItems(arrayOf(getString(R.string.reply))) { _, _ ->
+                    setPendingQuote(message)
+                }
+                .show()
+            return
+        }
+        val emojis = ChatManager.REACTION_EMOJIS
+        val items = (emojis + getString(R.string.reply)).toTypedArray()
         AlertDialog.Builder(this)
-            .setItems(arrayOf(getString(R.string.reply))) { _, _ ->
-                setPendingQuote(message)
+            .setItems(items) { _, which ->
+                if (which < emojis.size) {
+                    applyOwnReaction(message, emojis[which])
+                } else {
+                    setPendingQuote(message)
+                }
             }
             .show()
+    }
+
+    /**
+     * Reacts to [message] with [emoji] as this phone: the reaction is
+     * shown on our own screen at once (under our stamped wire name,
+     * so it means the same person here as on the other phones) and
+     * broadcast for the others to apply. Reactions toggle, so doing
+     * this twice with the same emoji takes the reaction back.
+     */
+    private fun applyOwnReaction(message: ChatMessage, emoji: String) {
+        val wireId = message.wireId ?: return
+        if (adapter.applyReaction(wireId, emoji, chatManager.wireSenderName())) {
+            ChatHistoryStore.save(this, adapter.snapshot())
+        }
+        chatManager.sendReaction(wireId, emoji)
     }
 
     /**
@@ -492,9 +534,11 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             return
         }
         val localId = nextLocalId++
+        val wireId = UUID.randomUUID().toString()
         if (!chatManager.sendVoiceMessage(
                 file, durationSeconds, localId,
-                pendingQuotedSender, pendingQuotedText
+                pendingQuotedSender, pendingQuotedText,
+                wireId = wireId
             )
         ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
@@ -509,7 +553,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 durationSeconds = durationSeconds,
                 localId = localId,
                 quotedSender = pendingQuotedSender,
-                quotedText = pendingQuotedText
+                quotedText = pendingQuotedText,
+                wireId = wireId
             )
         )
         clearPendingQuote()
@@ -566,8 +611,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             return
         }
         val localId = nextLocalId++
+        val wireId = UUID.randomUUID().toString()
         if (!chatManager.sendPhotoMessage(
-                file, localId, pendingQuotedSender, pendingQuotedText
+                file, localId, pendingQuotedSender, pendingQuotedText,
+                wireId = wireId
             )
         ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
@@ -581,7 +628,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 imagePath = file.absolutePath,
                 localId = localId,
                 quotedSender = pendingQuotedSender,
-                quotedText = pendingQuotedText
+                quotedText = pendingQuotedText,
+                wireId = wireId
             )
         )
         clearPendingQuote()
@@ -742,8 +790,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
         val durationSeconds = pickedVideoDurationSeconds(file)
         val localId = nextLocalId++
+        val wireId = UUID.randomUUID().toString()
         if (!chatManager.sendVideoMessage(
-                file, localId, pendingQuotedSender, pendingQuotedText
+                file, localId, pendingQuotedSender, pendingQuotedText,
+                wireId = wireId
             )
         ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
@@ -758,7 +808,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 durationSeconds = durationSeconds,
                 localId = localId,
                 quotedSender = pendingQuotedSender,
-                quotedText = pendingQuotedText
+                quotedText = pendingQuotedText,
+                wireId = wireId
             )
         )
         clearPendingQuote()
@@ -825,8 +876,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             }
         }
         val localId = nextLocalId++
+        val wireId = UUID.randomUUID().toString()
         if (!chatManager.sendFileMessage(
-                file, localId, pendingQuotedSender, pendingQuotedText
+                file, localId, pendingQuotedSender, pendingQuotedText,
+                wireId = wireId
             )
         ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
@@ -842,7 +895,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 fileSizeBytes = file.length(),
                 localId = localId,
                 quotedSender = pendingQuotedSender,
-                quotedText = pendingQuotedText
+                quotedText = pendingQuotedText,
+                wireId = wireId
             )
         )
         clearPendingQuote()
@@ -1098,7 +1152,11 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     /** Puts the position on its way and shows our own bubble at once. */
     private fun sendLocation(location: Location) {
         val localId = nextLocalId++
-        if (!chatManager.sendLocationMessage(location.latitude, location.longitude, localId)) {
+        val wireId = UUID.randomUUID().toString()
+        if (!chatManager.sendLocationMessage(
+                location.latitude, location.longitude, localId, wireId
+            )
+        ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
             return
         }
@@ -1109,7 +1167,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 type = ChatMessage.Type.LOCATION,
                 latitude = location.latitude,
                 longitude = location.longitude,
-                localId = localId
+                localId = localId,
+                wireId = wireId
             )
         )
         setStatus(getString(R.string.location_sent), R.color.status_connected)
@@ -1259,7 +1318,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         text: String,
         senderName: String?,
         quotedSender: String?,
-        quotedText: String?
+        quotedText: String?,
+        wireId: String?
     ) {
         if (closing) return
         addMessage(
@@ -1268,9 +1328,25 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 isSent = false,
                 senderName = senderName,
                 quotedSender = quotedSender,
-                quotedText = quotedText
+                quotedText = quotedText,
+                wireId = wireId
             )
         )
+    }
+
+    override fun onReactionReceived(
+        targetWireId: String,
+        emoji: String,
+        reactorName: String?
+    ) {
+        if (closing) return
+        // A reaction without a name cannot be attributed to anyone;
+        // one for a message this phone does not have (yet, or any
+        // more) is dropped by the adapter the same way.
+        val reactor = reactorName?.takeIf { it.isNotBlank() } ?: return
+        if (adapter.applyReaction(targetWireId, emoji, reactor)) {
+            ChatHistoryStore.save(this, adapter.snapshot())
+        }
     }
 
     override fun onMessageDelivered(localId: Long) {
@@ -1287,7 +1363,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         durationSeconds: Int,
         senderName: String?,
         quotedSender: String?,
-        quotedText: String?
+        quotedText: String?,
+        wireId: String?
     ) {
         if (closing) return
         addMessage(
@@ -1299,7 +1376,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 durationSeconds = durationSeconds,
                 senderName = senderName,
                 quotedSender = quotedSender,
-                quotedText = quotedText
+                quotedText = quotedText,
+                wireId = wireId
             )
         )
     }
@@ -1308,7 +1386,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         filePath: String,
         senderName: String?,
         quotedSender: String?,
-        quotedText: String?
+        quotedText: String?,
+        wireId: String?
     ) {
         if (closing) return
         addMessage(
@@ -1319,7 +1398,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 imagePath = filePath,
                 senderName = senderName,
                 quotedSender = quotedSender,
-                quotedText = quotedText
+                quotedText = quotedText,
+                wireId = wireId
             )
         )
     }
@@ -1329,7 +1409,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         durationSeconds: Int,
         senderName: String?,
         quotedSender: String?,
-        quotedText: String?
+        quotedText: String?,
+        wireId: String?
     ) {
         if (closing) return
         addMessage(
@@ -1341,7 +1422,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 durationSeconds = durationSeconds,
                 senderName = senderName,
                 quotedSender = quotedSender,
-                quotedText = quotedText
+                quotedText = quotedText,
+                wireId = wireId
             )
         )
     }
@@ -1352,7 +1434,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         fileSizeBytes: Long,
         senderName: String?,
         quotedSender: String?,
-        quotedText: String?
+        quotedText: String?,
+        wireId: String?
     ) {
         if (closing) return
         addMessage(
@@ -1365,7 +1448,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 fileSizeBytes = fileSizeBytes,
                 senderName = senderName,
                 quotedSender = quotedSender,
-                quotedText = quotedText
+                quotedText = quotedText,
+                wireId = wireId
             )
         )
     }
@@ -1373,7 +1457,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     override fun onLocationMessageReceived(
         latitude: Double,
         longitude: Double,
-        senderName: String?
+        senderName: String?,
+        wireId: String?
     ) {
         if (closing) return
         addMessage(
@@ -1383,7 +1468,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 type = ChatMessage.Type.LOCATION,
                 latitude = latitude,
                 longitude = longitude,
-                senderName = senderName
+                senderName = senderName,
+                wireId = wireId
             )
         )
     }

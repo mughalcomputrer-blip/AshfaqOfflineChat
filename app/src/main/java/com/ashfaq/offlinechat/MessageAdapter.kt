@@ -33,11 +33,12 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     private val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
 
     /**
-     * Called when the user long-presses a message and picks "Reply"
-     * (the screen shows the dialog and owns the reply state; the
-     * adapter only reports which message was chosen).
+     * Called when the user long-presses a message (the screen shows
+     * the menu — the reaction emojis and "Reply" — and owns the reply
+     * and reaction state; the adapter only reports which message was
+     * chosen).
      */
-    var onReplyRequested: ((ChatMessage) -> Unit)? = null
+    var onMessageMenuRequested: ((ChatMessage) -> Unit)? = null
 
     // Voice playback state: at most one voice message plays at a time.
     private var mediaPlayer: MediaPlayer? = null
@@ -68,6 +69,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val locationRow: View = view.findViewById(R.id.locationRow)
         val locationTitleText: TextView = view.findViewById(R.id.locationTitleText)
         val locationCoordsText: TextView = view.findViewById(R.id.locationCoordsText)
+        val reactionsText: TextView = view.findViewById(R.id.reactionsText)
         val timeText: TextView = view.findViewById(R.id.timeText)
         val ticksText: TextView = view.findViewById(R.id.ticksText)
     }
@@ -82,11 +84,12 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val message = messages[position]
         val context = holder.itemView.context
 
-        // A long press on a message offers "Reply". The photo and the
-        // play button consume their own touches, so they get the same
-        // listener; everything else on the row reaches the bubble.
+        // A long press on a message opens its menu (reactions and
+        // "Reply"). The photo and the play button consume their own
+        // touches, so they get the same listener; everything else on
+        // the row reaches the bubble.
         val replyOnLongClick = View.OnLongClickListener {
-            onReplyRequested?.invoke(message)
+            onMessageMenuRequested?.invoke(message)
             true
         }
         holder.bubble.setOnLongClickListener(replyOnLongClick)
@@ -153,6 +156,9 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.locationCoordsText.setTextColor(
                 ContextCompat.getColor(context, R.color.bubble_sent_text)
             )
+            holder.reactionsText.setTextColor(
+                ContextCompat.getColor(context, R.color.bubble_sent_text)
+            )
         } else {
             params.gravity = Gravity.START
             holder.bubble.setBackgroundResource(AppColors.bubbleReceivedDrawable(context))
@@ -165,8 +171,22 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.fileIcon.setColorFilter(AppColors.accent(context))
             holder.locationTitleText.setTextColor(AppColors.bubbleReceivedText(context))
             holder.locationCoordsText.setTextColor(AppColors.textSecondary(context))
+            holder.reactionsText.setTextColor(AppColors.textSecondary(context))
         }
         holder.bubble.layoutParams = params
+
+        // The reactions on this message, as one small line at the
+        // bottom of the bubble ("❤️ 2  👍 1") — only the emojis that
+        // were used, in the menu's fixed order, each with how many
+        // people picked it. Hidden while nobody reacted.
+        val reactionsLine = formatReactions(message)
+        if (reactionsLine == null) {
+            holder.reactionsText.visibility = View.GONE
+            holder.reactionsText.text = null
+        } else {
+            holder.reactionsText.visibility = View.VISIBLE
+            holder.reactionsText.text = reactionsLine
+        }
 
         // When this message is a reply, a quote strip at the top of the
         // bubble shows who was quoted and a preview of their message.
@@ -342,6 +362,56 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         messages[index] = messages[index].copy(delivered = true)
         notifyItemChanged(index)
         return true
+    }
+
+    /**
+     * Applies one person's reaction to the message known by [wireId]:
+     * [reactorName] reacting with [emoji]. Reactions toggle and each
+     * person has at most one: the same emoji again removes theirs, a
+     * different emoji moves theirs to the new one. The message's
+     * reaction map is updated in place and its row redrawn. Returns
+     * false when no shown message has that id (a reaction for a
+     * message this phone does not have is simply ignored), true when
+     * the reaction was applied.
+     */
+    fun applyReaction(wireId: String, emoji: String, reactorName: String): Boolean {
+        val index = messages.indexOfFirst { it.wireId == wireId }
+        if (index < 0) return false
+        val reactions = messages[index].reactions
+        // The emoji this person has on the message now, if any.
+        val current = reactions.entries
+            .firstOrNull { reactorName in it.value }?.key
+        if (current == emoji) {
+            reactions[emoji]?.remove(reactorName)
+            if (reactions[emoji].isNullOrEmpty()) reactions.remove(emoji)
+        } else {
+            if (current != null) {
+                reactions[current]?.remove(reactorName)
+                if (reactions[current].isNullOrEmpty()) reactions.remove(current)
+            }
+            reactions.getOrPut(emoji) { mutableSetOf() }.add(reactorName)
+        }
+        notifyItemChanged(index)
+        return true
+    }
+
+    /**
+     * The reactions line for a bubble: every used emoji (in the
+     * menu's fixed order, so all phones render the same line) with
+     * the number of people who picked it, joined by wide spaces —
+     * "❤️ 2  👍 1". Null when the message has no reactions.
+     */
+    private fun formatReactions(message: ChatMessage): String? {
+        if (message.reactions.isEmpty()) return null
+        val parts = mutableListOf<String>()
+        for (emoji in ChatManager.REACTION_EMOJIS) {
+            val count = message.reactions[emoji]?.size ?: 0
+            if (count > 0) parts.add("$emoji $count")
+        }
+        // An emoji outside the known six cannot arrive (the wire
+        // parser rejects it), but a hand-edited history could hold
+        // one; it is simply not shown.
+        return parts.takeIf { it.isNotEmpty() }?.joinToString("  ")
     }
 
     /** A copy of the messages currently shown, oldest first. */

@@ -40,7 +40,21 @@ data class ChatMessage(
     // whether that transfer has finished (the "delivered" ticks).
     // Received messages and history from older versions keep 0/false.
     val localId: Long = 0,
-    val delivered: Boolean = false
+    val delivered: Boolean = false,
+    // The id the OTHER phones know this message by (unlike [localId],
+    // which never leaves this phone): for a text or location message
+    // it is the "#ID#" uuid inside its payload; for a voice, photo,
+    // video or file message it is the uuid the sender announced in a
+    // "#MID#" text just before the file. Reactions refer to a message
+    // by this id. Null for media saved by older app versions, which
+    // announced no id — those messages can be replied to but not
+    // reacted to.
+    val wireId: String? = null,
+    // Emoji reactions on this message: emoji -> the names of the
+    // people who reacted with it. A person appears under at most one
+    // emoji (reacting with another one moves them, reacting with the
+    // same one again removes them). Empty when nobody reacted.
+    val reactions: MutableMap<String, MutableSet<String>> = mutableMapOf()
 ) {
     enum class Type { TEXT, VOICE, PHOTO, FILE, VIDEO, LOCATION }
 }
