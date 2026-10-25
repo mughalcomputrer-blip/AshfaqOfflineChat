@@ -2,6 +2,7 @@ package com.ashfaq.offlinechat
 
 import android.Manifest
 import android.content.pm.ActivityInfo
+import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -142,6 +143,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         val buttonSend: MaterialButton = findViewById(R.id.buttonSend)
         val buttonName: TextView = findViewById(R.id.buttonName)
         val buttonClearChat: TextView = findViewById(R.id.buttonClearChat)
+        val buttonTheme: TextView = findViewById(R.id.buttonTheme)
         val buttonCancelQuote: ImageButton = findViewById(R.id.buttonCancelQuote)
 
         adapter = MessageAdapter()
@@ -169,7 +171,77 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonFile.setOnClickListener { onFileClicked() }
         buttonName.setOnClickListener { showNameDialog() }
         buttonClearChat.setOnClickListener { confirmClearChat() }
+        buttonTheme.setOnClickListener { toggleDarkMode() }
         buttonCancelQuote.setOnClickListener { clearPendingQuote() }
+
+        applyThemeColors(buttonFind, buttonDisconnect, buttonSend, buttonTheme)
+    }
+
+    /** Flips the dark-mode switch and rebuilds the screen in the new palette. */
+    private fun toggleDarkMode() {
+        AppColors.setDark(this, !AppColors.isDark(this))
+        recreate()
+    }
+
+    /**
+     * Paints the whole screen — background, header, quote bar, input
+     * row, status bar — from AppColors. Called once in onCreate; with
+     * dark mode off it sets exactly the colors the layouts name, so the
+     * light screen is unchanged.
+     */
+    private fun applyThemeColors(
+        buttonFind: MaterialButton,
+        buttonDisconnect: MaterialButton,
+        buttonSend: MaterialButton,
+        buttonTheme: TextView
+    ) {
+        val dark = AppColors.isDark(this)
+        findViewById<View>(R.id.rootLayout)
+            .setBackgroundColor(AppColors.screenBackground(this))
+        findViewById<View>(R.id.headerBar)
+            .setBackgroundColor(AppColors.headerBackground(this))
+        findViewById<TextView>(R.id.titleText)
+            .setTextColor(AppColors.headerText(this))
+        findViewById<TextView>(R.id.buttonName)
+            .setTextColor(AppColors.headerText(this))
+        findViewById<TextView>(R.id.buttonClearChat)
+            .setTextColor(AppColors.headerText(this))
+        buttonTheme.setTextColor(AppColors.headerText(this))
+        buttonTheme.text = if (dark) "☀️" else "🌙"
+        window.statusBarColor = AppColors.statusBar(this)
+        statusText.setTextColor(AppColors.statusColor(this, R.color.status_idle))
+
+        quoteBar.setBackgroundColor(AppColors.inputBarBackground(this))
+        findViewById<View>(R.id.quoteBarStrip)
+            .setBackgroundColor(AppColors.accent(this))
+        quoteBarSender.setTextColor(AppColors.accent(this))
+        quoteBarText.setTextColor(AppColors.textSecondary(this))
+        findViewById<ImageButton>(R.id.buttonCancelQuote)
+            .setColorFilter(AppColors.textSecondary(this))
+
+        findViewById<View>(R.id.inputBar)
+            .setBackgroundColor(AppColors.inputBarBackground(this))
+        editMessage.setBackgroundResource(AppColors.inputFieldDrawable(this))
+        editMessage.setTextColor(AppColors.textPrimary(this))
+        editMessage.setHintTextColor(AppColors.textSecondary(this))
+        buttonPhoto.setColorFilter(AppColors.iconTint(this))
+        buttonFile.setColorFilter(AppColors.iconTint(this))
+        buttonMic.setColorFilter(AppColors.iconTint(this))
+
+        // The Find / Disconnect / Send buttons take their colors from
+        // the (light) app theme, which would leave the outlined
+        // Disconnect button nearly invisible on the dark background —
+        // in dark mode they get readable colors by hand instead.
+        if (dark) {
+            buttonFind.backgroundTintList =
+                ColorStateList.valueOf(AppColors.headerBackground(this))
+            buttonFind.setTextColor(AppColors.headerText(this))
+            buttonDisconnect.setTextColor(AppColors.headerText(this))
+            buttonDisconnect.strokeColor =
+                ColorStateList.valueOf(AppColors.textSecondary(this))
+            buttonSend.backgroundTintList =
+                ColorStateList.valueOf(AppColors.accent(this))
+        }
     }
 
     override fun onDestroy() {
@@ -348,7 +420,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         recordingFile = file
         recordingStartedAt = SystemClock.elapsedRealtime()
         isRecording = true
-        buttonMic.setColorFilter(ContextCompat.getColor(this, R.color.status_error))
+        buttonMic.setColorFilter(AppColors.statusColor(this, R.color.status_error))
         setStatus(getString(R.string.recording_status), R.color.status_error)
         recordHandler.removeCallbacks(autoStopRecording)
         recordHandler.postDelayed(autoStopRecording, MAX_RECORDING_MS)
@@ -378,7 +450,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         recorder = null
         recordingFile = null
         isRecording = false
-        buttonMic.setColorFilter(ContextCompat.getColor(this, R.color.primary))
+        buttonMic.setColorFilter(AppColors.iconTint(this))
 
         if (!stoppedOk || file == null || !file.exists() || file.length() == 0L) {
             file?.delete()
@@ -842,7 +914,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
     private fun setStatus(text: String, colorRes: Int) {
         statusText.text = text
-        statusText.setTextColor(ContextCompat.getColor(this, colorRes))
+        statusText.setTextColor(AppColors.statusColor(this, colorRes))
     }
 
     private fun addMessage(message: ChatMessage) {

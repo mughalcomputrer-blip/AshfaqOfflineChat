@@ -55,6 +55,7 @@
 
 <string name="your_name">Name</string>
 <string name="clear_chat">Clear</string>
+<string name="theme_toggle">Dark mode on or off</string>
 <string name="name_dialog_title">Your display name</string>
 <string name="name_dialog_message">This is the name the other phone sees when you connect. Leave it empty to use your phone model instead.</string>
 <string name="name_dialog_hint">Your name</string>

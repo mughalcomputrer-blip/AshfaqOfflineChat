@@ -34,4 +34,31 @@
     <color name="status_connected">#2E7D32</color>
     <color name="status_idle">#5D6D7E</color>
     <color name="status_error">#C62828</color>
+
+    <!-- Dark mode palette. These are never referenced from layouts;
+         AppColors picks them at runtime when the user turns dark mode
+         on. The light colors above stay the default and are unchanged. -->
+    <color name="header_dark_mode">#12222E</color>
+    <color name="screen_background_dark_mode">#0B141B</color>
+    <color name="text_primary_dark_mode">#E9EDEF</color>
+    <color name="text_secondary_dark_mode">#AEBAC1</color>
+    <color name="accent_dark_mode">#1CC8B4</color>
+
+    <color name="bubble_sent_dark_mode">#0B7563</color>
+    <color name="bubble_received_dark_mode">#1F2C34</color>
+    <color name="bubble_received_text_dark_mode">#E9EDEF</color>
+    <color name="bubble_received_stroke_dark_mode">#2A3942</color>
+
+    <!-- Slightly lighter than the dark bubbles they sit inside. -->
+    <color name="quote_sent_bg_dark_mode">#0E8570</color>
+    <color name="quote_received_bg_dark_mode">#2A3942</color>
+
+    <color name="video_placeholder_dark_mode">#2E3B42</color>
+
+    <color name="input_bar_background_dark_mode">#1F2C34</color>
+    <color name="input_stroke_dark_mode">#2A3942</color>
+
+    <color name="status_connected_dark_mode">#3EC97E</color>
+    <color name="status_idle_dark_mode">#AEBAC1</color>
+    <color name="status_error_dark_mode">#EF5350</color>
 </resources>

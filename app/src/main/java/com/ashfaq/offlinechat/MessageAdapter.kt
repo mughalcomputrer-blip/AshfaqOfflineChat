@@ -92,6 +92,9 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
 
         holder.messageText.text = message.text
         holder.timeText.text = timeFormat.format(Date(message.timestamp))
+        // The sender-name label's color is only named in the layout
+        // (the light accent); repaint it per the current palette.
+        holder.senderNameText.setTextColor(AppColors.accent(context))
 
         // WhatsApp-style ticks next to the time, on our own messages
         // only: one tick = handed to Nearby for sending, two ticks =
@@ -118,7 +121,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val params = holder.bubble.layoutParams as LinearLayout.LayoutParams
         if (message.isSent) {
             params.gravity = Gravity.END
-            holder.bubble.setBackgroundResource(R.drawable.bg_bubble_sent)
+            holder.bubble.setBackgroundResource(AppColors.bubbleSentDrawable(context))
             holder.messageText.setTextColor(
                 ContextCompat.getColor(context, R.color.bubble_sent_text)
             )
@@ -142,28 +145,14 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             )
         } else {
             params.gravity = Gravity.START
-            holder.bubble.setBackgroundResource(R.drawable.bg_bubble_received)
-            holder.messageText.setTextColor(
-                ContextCompat.getColor(context, R.color.bubble_received_text)
-            )
-            holder.timeText.setTextColor(
-                ContextCompat.getColor(context, R.color.text_secondary)
-            )
-            holder.durationText.setTextColor(
-                ContextCompat.getColor(context, R.color.bubble_received_text)
-            )
-            holder.buttonPlay.setColorFilter(
-                ContextCompat.getColor(context, R.color.accent)
-            )
-            holder.fileNameText.setTextColor(
-                ContextCompat.getColor(context, R.color.bubble_received_text)
-            )
-            holder.fileSizeText.setTextColor(
-                ContextCompat.getColor(context, R.color.text_secondary)
-            )
-            holder.fileIcon.setColorFilter(
-                ContextCompat.getColor(context, R.color.accent)
-            )
+            holder.bubble.setBackgroundResource(AppColors.bubbleReceivedDrawable(context))
+            holder.messageText.setTextColor(AppColors.bubbleReceivedText(context))
+            holder.timeText.setTextColor(AppColors.textSecondary(context))
+            holder.durationText.setTextColor(AppColors.bubbleReceivedText(context))
+            holder.buttonPlay.setColorFilter(AppColors.accent(context))
+            holder.fileNameText.setTextColor(AppColors.bubbleReceivedText(context))
+            holder.fileSizeText.setTextColor(AppColors.textSecondary(context))
+            holder.fileIcon.setColorFilter(AppColors.accent(context))
         }
         holder.bubble.layoutParams = params
 
@@ -177,7 +166,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.quoteSenderText.text = quotedSender
             holder.quoteText.text = quotedText
             if (message.isSent) {
-                holder.quoteBlock.setBackgroundResource(R.drawable.bg_quote_sent)
+                holder.quoteBlock.setBackgroundResource(AppColors.quoteSentDrawable(context))
                 holder.quoteStrip.setBackgroundColor(
                     ContextCompat.getColor(context, R.color.on_primary)
                 )
@@ -188,16 +177,12 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                     ContextCompat.getColor(context, R.color.quote_sent_text)
                 )
             } else {
-                holder.quoteBlock.setBackgroundResource(R.drawable.bg_quote_received)
-                holder.quoteStrip.setBackgroundColor(
-                    ContextCompat.getColor(context, R.color.accent)
+                holder.quoteBlock.setBackgroundResource(
+                    AppColors.quoteReceivedDrawable(context)
                 )
-                holder.quoteSenderText.setTextColor(
-                    ContextCompat.getColor(context, R.color.accent)
-                )
-                holder.quoteText.setTextColor(
-                    ContextCompat.getColor(context, R.color.text_secondary)
-                )
+                holder.quoteStrip.setBackgroundColor(AppColors.accent(context))
+                holder.quoteSenderText.setTextColor(AppColors.accent(context))
+                holder.quoteText.setTextColor(AppColors.textSecondary(context))
             }
         } else {
             holder.quoteBlock.visibility = View.GONE
@@ -488,7 +473,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     private fun videoPlaceholderBitmap(context: Context): Bitmap {
         videoPlaceholder?.let { return it }
         val bitmap = Bitmap.createBitmap(440, 260, Bitmap.Config.ARGB_8888)
-        bitmap.eraseColor(ContextCompat.getColor(context, R.color.video_placeholder))
+        bitmap.eraseColor(AppColors.videoPlaceholder(context))
         videoPlaceholder = bitmap
         return bitmap
     }
