@@ -80,4 +80,21 @@
 <string name="clear_chat_confirm">Clear</string>
 <string name="chat_cleared">Chat cleared</string>
 
+<string name="pin_lock">PIN lock settings</string>
+<string name="pin_lock_title">PIN lock</string>
+<string name="pin_lock_hint">Enter your PIN to unlock</string>
+<string name="pin_hint">4-digit PIN</string>
+<string name="unlock">Unlock</string>
+<string name="pin_wrong">Wrong PIN</string>
+<string name="pin_set">PIN set</string>
+<string name="pin_updated">PIN changed</string>
+<string name="pin_removed">PIN removed</string>
+<string name="pin_change">Change PIN</string>
+<string name="pin_remove">Remove PIN</string>
+<string name="pin_enter_new">Enter a new PIN</string>
+<string name="pin_confirm_new">Enter the new PIN again</string>
+<string name="pin_enter_current">Enter your current PIN</string>
+<string name="pin_must_be_4">PIN must be exactly 4 digits</string>
+<string name="pin_mismatch">The two PINs do not match</string>
+
 </resources>

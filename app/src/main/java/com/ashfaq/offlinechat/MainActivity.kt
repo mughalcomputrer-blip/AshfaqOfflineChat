@@ -23,8 +23,11 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.text.Editable
+import android.text.InputFilter
+import android.text.InputType
 import android.text.TextWatcher
 import android.view.View
+import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.MimeTypeMap
 import android.widget.EditText
@@ -61,6 +64,37 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private lateinit var searchBar: View
     private lateinit var editSearch: EditText
     private lateinit var buttonCloseSearch: ImageButton
+    private lateinit var buttonFind: MaterialButton
+    private lateinit var buttonDisconnect: MaterialButton
+    private lateinit var buttonSend: MaterialButton
+    private lateinit var buttonName: TextView
+    private lateinit var buttonClearChat: TextView
+    private lateinit var buttonTheme: TextView
+    private lateinit var buttonCancelQuote: ImageButton
+    private lateinit var buttonLock: TextView
+    private lateinit var lockOverlay: View
+    private lateinit var lockTitle: TextView
+    private lateinit var lockHint: TextView
+    private lateinit var editPin: EditText
+    private lateinit var textPinError: TextView
+    private lateinit var buttonUnlock: MaterialButton
+
+    // True once startApp() has run. The normal startup has to happen
+    // exactly once — either straight away in onCreate, or after the
+    // PIN gate lets the user through — and this is the guard.
+    private var appStarted = false
+
+    companion object {
+        /**
+         * Whether this process has already passed the PIN gate.
+         * Static on purpose: recreate() for the dark-mode toggle
+         * builds a new activity in the same process and must not
+         * demand the PIN again mid-session, while a genuinely fresh
+         * app start (a new process — including after Android killed
+         * the backgrounded app) starts locked again when a PIN is set.
+         */
+        private var sessionUnlocked = false
+    }
 
     private var requestDialog: AlertDialog? = null
     private var closing = false
@@ -75,7 +109,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     // Ids for our own sent messages, handed out one per message, so a
     // finished transfer can be matched back to its chat row (the
     // "delivered" ticks). Continued after the loaded history in
-    // onCreate, so ids never repeat within the saved chat.
+    // startApp, so ids never repeat within the saved chat.
     private var nextLocalId = 1L
 
     // Voice recording state.
@@ -180,13 +214,68 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         searchBar = findViewById(R.id.searchBar)
         editSearch = findViewById(R.id.editSearch)
         buttonCloseSearch = findViewById(R.id.buttonCloseSearch)
-        val buttonFind: MaterialButton = findViewById(R.id.buttonFind)
-        val buttonDisconnect: MaterialButton = findViewById(R.id.buttonDisconnect)
-        val buttonSend: MaterialButton = findViewById(R.id.buttonSend)
-        val buttonName: TextView = findViewById(R.id.buttonName)
-        val buttonClearChat: TextView = findViewById(R.id.buttonClearChat)
-        val buttonTheme: TextView = findViewById(R.id.buttonTheme)
-        val buttonCancelQuote: ImageButton = findViewById(R.id.buttonCancelQuote)
+        buttonFind = findViewById(R.id.buttonFind)
+        buttonDisconnect = findViewById(R.id.buttonDisconnect)
+        buttonSend = findViewById(R.id.buttonSend)
+        buttonName = findViewById(R.id.buttonName)
+        buttonClearChat = findViewById(R.id.buttonClearChat)
+        buttonTheme = findViewById(R.id.buttonTheme)
+        buttonCancelQuote = findViewById(R.id.buttonCancelQuote)
+        buttonLock = findViewById(R.id.buttonLock)
+        lockOverlay = findViewById(R.id.lockOverlay)
+        lockTitle = findViewById(R.id.lockTitle)
+        lockHint = findViewById(R.id.lockHint)
+        editPin = findViewById(R.id.editPin)
+        textPinError = findViewById(R.id.textPinError)
+        buttonUnlock = findViewById(R.id.buttonUnlock)
+
+        // The theme is painted first and always: when a PIN is set,
+        // the lock screen is the first thing seen, and it must already
+        // wear the right palette before anything else happens.
+        applyThemeColors()
+
+        // These two buttons never touch the chat machinery, so they
+        // can be wired ahead of the PIN gate — though the gate's
+        // overlay keeps both unreachable until the app is unlocked.
+        buttonTheme.setOnClickListener { toggleDarkMode() }
+        buttonLock.setOnClickListener { showPinLockMenu() }
+
+        // The PIN gate. While the lock screen is up, none of the
+        // normal startup runs: no chat manager, no saved chat on
+        // screen, no permission prompts, no searching for phones.
+        // A correct PIN runs startApp() then, exactly once.
+        if (PinLock.isSet(this) && !sessionUnlocked) {
+            lockOverlay.visibility = View.VISIBLE
+            buttonUnlock.setOnClickListener { tryUnlock() }
+            editPin.setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_DONE) {
+                    tryUnlock()
+                    true
+                } else {
+                    false
+                }
+            }
+            editPin.requestFocus()
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE)
+                as InputMethodManager
+            imm.showSoftInput(editPin, InputMethodManager.SHOW_IMPLICIT)
+        } else {
+            // No PIN to pass — or already passed earlier in this
+            // session, which is where the dark-mode recreate lands.
+            sessionUnlocked = true
+            startApp()
+        }
+    }
+
+    /**
+     * The app's normal startup: the adapter, the saved chat, the chat
+     * manager and every button that works with them. It used to live
+     * in onCreate; the PIN gate now holds it back until the user
+     * unlocks, and the [appStarted] guard keeps it to one run.
+     */
+    private fun startApp() {
+        if (appStarted) return
+        appStarted = true
 
         adapter = MessageAdapter()
         adapter.onMessageMenuRequested = { message -> showMessageMenu(message) }
@@ -214,7 +303,6 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonLocation.setOnClickListener { onLocationClicked() }
         buttonName.setOnClickListener { showNameDialog() }
         buttonClearChat.setOnClickListener { confirmClearChat() }
-        buttonTheme.setOnClickListener { toggleDarkMode() }
         buttonCancelQuote.setOnClickListener { clearPendingQuote() }
         buttonSearch.setOnClickListener { toggleSearchBar() }
         buttonCloseSearch.setOnClickListener { closeSearch() }
@@ -232,8 +320,26 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
             override fun afterTextChanged(s: Editable?) {}
         })
+    }
 
-        applyThemeColors(buttonFind, buttonDisconnect, buttonSend, buttonTheme)
+    /**
+     * The Unlock button on the lock screen. A correct PIN hides the
+     * lock, clears the field and runs the held-back startup; a wrong
+     * one shows the error, clears the field and stays locked. There
+     * is deliberately no way around this screen — pressing Back just
+     * leaves the app, as usual.
+     */
+    private fun tryUnlock() {
+        if (PinLock.verify(this, editPin.text.toString())) {
+            sessionUnlocked = true
+            textPinError.visibility = View.GONE
+            editPin.text.clear()
+            lockOverlay.visibility = View.GONE
+            startApp()
+        } else {
+            textPinError.visibility = View.VISIBLE
+            editPin.text.clear()
+        }
     }
 
     /** Flips the dark-mode switch and rebuilds the screen in the new palette. */
@@ -248,12 +354,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
      * dark mode off it sets exactly the colors the layouts name, so the
      * light screen is unchanged.
      */
-    private fun applyThemeColors(
-        buttonFind: MaterialButton,
-        buttonDisconnect: MaterialButton,
-        buttonSend: MaterialButton,
-        buttonTheme: TextView
-    ) {
+    private fun applyThemeColors() {
         val dark = AppColors.isDark(this)
         findViewById<View>(R.id.rootLayout)
             .setBackgroundColor(AppColors.screenBackground(this))
@@ -289,11 +390,25 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonLocation.setColorFilter(AppColors.iconTint(this))
 
         buttonSearch.setTextColor(AppColors.headerText(this))
+        buttonLock.setTextColor(AppColors.headerText(this))
         searchBar.setBackgroundColor(AppColors.inputBarBackground(this))
         editSearch.setBackgroundResource(AppColors.inputFieldDrawable(this))
         editSearch.setTextColor(AppColors.textPrimary(this))
         editSearch.setHintTextColor(AppColors.textSecondary(this))
         buttonCloseSearch.setColorFilter(AppColors.textSecondary(this))
+
+        // The lock screen may be the first thing the user sees, so it
+        // is painted here with everything else: same background, input
+        // field and text colors as the chat behind it.
+        lockOverlay.setBackgroundColor(AppColors.screenBackground(this))
+        lockTitle.setTextColor(AppColors.textPrimary(this))
+        lockHint.setTextColor(AppColors.textSecondary(this))
+        editPin.setBackgroundResource(AppColors.inputFieldDrawable(this))
+        editPin.setTextColor(AppColors.textPrimary(this))
+        editPin.setHintTextColor(AppColors.textSecondary(this))
+        textPinError.setTextColor(
+            AppColors.statusColor(this, R.color.status_error)
+        )
 
         // The Find / Disconnect / Send buttons take their colors from
         // the (light) app theme, which would leave the outlined
@@ -308,6 +423,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 ColorStateList.valueOf(AppColors.textSecondary(this))
             buttonSend.backgroundTintList =
                 ColorStateList.valueOf(AppColors.accent(this))
+            buttonUnlock.backgroundTintList =
+                ColorStateList.valueOf(AppColors.accent(this))
         }
     }
 
@@ -316,7 +433,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         requestDialog?.dismiss()
         discardRecording()
         stopLocationWait()
-        chatManager.disconnect()
+        // If the app is closed from the PIN lock screen, startApp()
+        // never ran and there is no chat manager to stop.
+        if (::chatManager.isInitialized) chatManager.disconnect()
         super.onDestroy()
     }
 
@@ -1323,6 +1442,112 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 adapter.clearMessages()
                 ChatHistoryStore.clear(this)
                 Toast.makeText(this, R.string.chat_cleared, Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    // ---------- PIN lock ----------
+
+    /**
+     * The 🔒 header button. With no PIN set it goes straight to the
+     * set flow; with one set it offers Change or Remove, and both of
+     * those first ask for the current PIN. This only ever runs while
+     * the app is unlocked — at the lock screen the header sits under
+     * the overlay, out of reach.
+     */
+    private fun showPinLockMenu() {
+        if (!PinLock.isSet(this)) {
+            promptNewPin(R.string.pin_set)
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.pin_lock_title)
+            .setItems(
+                arrayOf(
+                    getString(R.string.pin_change),
+                    getString(R.string.pin_remove)
+                )
+            ) { _, which ->
+                when (which) {
+                    0 -> promptCurrentPin { promptNewPin(R.string.pin_updated) }
+                    1 -> promptCurrentPin {
+                        PinLock.remove(this)
+                        Toast.makeText(
+                            this, R.string.pin_removed, Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /** Asks for the current PIN; runs [action] only when it checks out. */
+    private fun promptCurrentPin(action: () -> Unit) {
+        promptPin(R.string.pin_enter_current) { pin ->
+            if (PinLock.verify(this, pin)) {
+                action()
+            } else {
+                Toast.makeText(this, R.string.pin_wrong, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    /**
+     * The set/change flow: a new PIN, then the same PIN once more to
+     * be sure. Only a matching pair is saved; [doneMessage] is the
+     * toast shown on success ("PIN set" the first time, "PIN
+     * changed" afterwards).
+     */
+    private fun promptNewPin(doneMessage: Int) {
+        promptPin(R.string.pin_enter_new) { newPin ->
+            promptPin(R.string.pin_confirm_new) { confirmed ->
+                if (confirmed == newPin) {
+                    PinLock.setPin(this, newPin)
+                    Toast.makeText(this, doneMessage, Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(
+                        this, R.string.pin_mismatch, Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+    }
+
+    /**
+     * One dialog with a single numeric-password field, in the same
+     * shape as the display-name dialog. The entered text goes to
+     * [onEntered] — but only when it is exactly 4 digits; anything
+     * else gets an explanation and the flow stops there.
+     */
+    private fun promptPin(title: Int, onEntered: (String) -> Unit) {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or
+                InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            filters = arrayOf(InputFilter.LengthFilter(4))
+            setSingleLine(true)
+            hint = getString(R.string.pin_hint)
+        }
+        // Give the text field some room inside the dialog.
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val side = (20 * resources.displayMetrics.density).toInt()
+            setPadding(side, 0, side, 0)
+            addView(input)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(container)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val pin = input.text.toString()
+                if (pin.length == 4 && pin.all { it.isDigit() }) {
+                    onEntered(pin)
+                } else {
+                    Toast.makeText(
+                        this, R.string.pin_must_be_4, Toast.LENGTH_SHORT
+                    ).show()
+                }
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
