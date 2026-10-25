@@ -94,6 +94,16 @@
             android:textColor="@color/text_primary"
             android:textColorHint="@color/text_secondary" />
 
+        <ImageButton
+            android:id="@+id/buttonMic"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"
+            android:background="@android:color/transparent"
+            android:contentDescription="@string/record_voice"
+            android:src="@android:drawable/ic_btn_speak_now"
+            android:tint="@color/primary" />
+
         <com.google.android.material.button.MaterialButton
             android:id="@+id/buttonSend"
             android:layout_width="wrap_content"

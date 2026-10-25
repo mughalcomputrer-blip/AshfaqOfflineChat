@@ -19,6 +19,14 @@
 
 <string name="permissions_denied">Permission denied. The app cannot find nearby phones without it.</string>
 <string name="not_connected_cannot_send">Not connected. Message not sent.</string>
+
+<string name="record_voice">Record a voice message</string>
+<string name="play_voice">Play voice message</string>
+<string name="recording_status">Recording... tap the mic again to send</string>
+<string name="mic_permission_needed">Microphone permission is needed for voice messages</string>
+<string name="not_connected_voice">Not connected. Voice message not recorded.</string>
+<string name="voice_recording_failed">Recording failed. Please try again.</string>
+<string name="voice_sent">Voice message sent</string>
 <string name="error_generic">Error: %1$s</string>
 <string name="error_hint">Make sure Bluetooth and Location are turned on, and that the other phone is also searching.</string>
 

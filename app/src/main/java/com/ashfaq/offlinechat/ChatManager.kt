@@ -1,9 +1,11 @@
 package com.ashfaq.offlinechat
 
 import android.content.Context
+import android.media.MediaMetadataRetriever
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.AdvertisingOptions
 import com.google.android.gms.nearby.connection.ConnectionInfo
@@ -17,6 +19,7 @@ import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
+import java.io.File
 import java.util.UUID
 
 class ChatManager(
@@ -40,8 +43,12 @@ class ChatManager(
 
         /** The connection dropped and an automatic retry is about to happen. */
         fun onReconnecting(attempt: Int, maxAttempts: Int) {}
+
+        /** A voice message arrived; [filePath] points to our own copy of it. */
+        fun onVoiceMessageReceived(filePath: String, durationSeconds: Int) {}
     }
 
+    private val appContext: Context = context.applicationContext
     private val client = Nearby.getConnectionsClient(context.applicationContext)
     private val strategy = Strategy.P2P_POINT_TO_POINT
     private val handler = Handler(Looper.getMainLooper())
@@ -62,6 +69,13 @@ class ChatManager(
 
     // Ids of messages we already showed, so a repeated delivery is dropped.
     private val seenMessageIds = LinkedHashSet<String>()
+
+    // File payloads that arrived and are still being transferred.
+    private val incomingFilePayloads = mutableMapOf<Long, Payload>()
+
+    // Length (seconds) of the voice file that is on its way, told to us by
+    // the small info message the sender sends just before the file.
+    private var pendingVoiceDurationSeconds: Int? = null
 
     fun isConnected(): Boolean = connectedEndpointId != null
 
@@ -103,10 +117,33 @@ class ChatManager(
         return true
     }
 
+    /**
+     * Sends a recorded voice message. A file payload cannot carry any extra
+     * info, so we first send a tiny text info ("#VOICE#" + seconds + "#" +
+     * file name) and then the audio file itself.
+     */
+    fun sendVoiceMessage(file: File, durationSeconds: Int): Boolean {
+        val endpointId = connectedEndpointId ?: return false
+        val info = VOICE_PREFIX + durationSeconds + "#" + file.name
+        client.sendPayload(endpointId, Payload.fromBytes(info.toByteArray(Charsets.UTF_8)))
+            .addOnFailureListener { e -> listener.onError(describe(e)) }
+        val filePayload = try {
+            Payload.fromFile(file)
+        } catch (e: Exception) {
+            listener.onError("The voice message could not be sent.")
+            return false
+        }
+        client.sendPayload(endpointId, filePayload)
+            .addOnFailureListener { e -> listener.onError(describe(e)) }
+        return true
+    }
+
     private fun stopEverything() {
         handler.removeCallbacks(reconnectRunnable)
         connectedEndpointId = null
         pendingEndpointId = null
+        incomingFilePayloads.clear()
+        pendingVoiceDurationSeconds = null
         client.stopAdvertising()
         client.stopDiscovery()
         client.stopAllEndpoints()
@@ -231,13 +268,28 @@ class ChatManager(
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
             // Ignore anything that does not come from the phone we accepted.
             if (endpointId != connectedEndpointId) return
-            if (payload.type != Payload.Type.BYTES) return
-            val bytes = payload.asBytes() ?: return
-            val (messageId, text) = unpackMessage(String(bytes, Charsets.UTF_8))
-            if (messageId != null && !rememberMessageId(messageId)) {
-                return // We already showed this message once.
+            when (payload.type) {
+                Payload.Type.FILE -> {
+                    // Remember the file; it is usable once the transfer
+                    // finishes with SUCCESS in onPayloadTransferUpdate.
+                    incomingFilePayloads[payload.id] = payload
+                }
+                Payload.Type.BYTES -> {
+                    val bytes = payload.asBytes() ?: return
+                    val raw = String(bytes, Charsets.UTF_8)
+                    if (raw.startsWith(VOICE_PREFIX)) {
+                        // Info about the voice file that follows.
+                        parseVoiceInfo(raw)?.let { pendingVoiceDurationSeconds = it }
+                        return
+                    }
+                    val (messageId, text) = unpackMessage(raw)
+                    if (messageId != null && !rememberMessageId(messageId)) {
+                        return // We already showed this message once.
+                    }
+                    listener.onMessageReceived(text)
+                }
+                else -> Unit
             }
-            listener.onMessageReceived(text)
         }
 
         override fun onPayloadTransferUpdate(
@@ -246,7 +298,97 @@ class ChatManager(
         ) {
             if (endpointId != connectedEndpointId) return
             if (update.status == PayloadTransferUpdate.Status.FAILURE) {
+                incomingFilePayloads.remove(update.payloadId)
                 listener.onError("A message could not be transferred.")
+            } else if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
+                val filePayload = incomingFilePayloads.remove(update.payloadId)
+                if (filePayload != null) {
+                    saveReceivedVoiceFile(filePayload)
+                }
+            }
+        }
+    }
+
+    /**
+     * Reads the length in seconds out of a voice info text
+     * ("#VOICE#" + seconds + "#" + file name). Null when it does not parse;
+     * the length is then read from the audio file itself instead.
+     */
+    private fun parseVoiceInfo(raw: String): Int? {
+        val rest = raw.substring(VOICE_PREFIX.length)
+        val separator = rest.indexOf('#')
+        if (separator <= 0) return null
+        return rest.substring(0, separator).toIntOrNull()
+    }
+
+    /** Copies a fully received voice file into our own storage and shows it. */
+    private fun saveReceivedVoiceFile(payload: Payload) {
+        val filePart = payload.asFile() ?: return
+        val voiceDir = File(appContext.filesDir, VOICE_DIR_NAME)
+        if (!voiceDir.exists()) voiceDir.mkdirs()
+        val dest = File(voiceDir, "voice_${System.currentTimeMillis()}.m4a")
+        if (!copyPayloadFile(filePart, dest) || !dest.exists() || dest.length() == 0L) {
+            dest.delete()
+            listener.onError("A voice message could not be saved.")
+            return
+        }
+        // Prefer the length the sender told us; fall back to the file itself.
+        val duration = pendingVoiceDurationSeconds ?: fileDurationSeconds(dest)
+        pendingVoiceDurationSeconds = null
+        listener.onVoiceMessageReceived(dest.absolutePath, duration)
+    }
+
+    private fun copyPayloadFile(filePart: Payload.File, dest: File): Boolean {
+        // Newer Android versions: read the bytes through the file descriptor.
+        val descriptor = try {
+            filePart.asParcelFileDescriptor()
+        } catch (e: Exception) {
+            null
+        }
+        if (descriptor != null) {
+            val ok = try {
+                ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input ->
+                    dest.outputStream().use { output -> input.copyTo(output) }
+                }
+                dest.length() > 0
+            } catch (e: Exception) {
+                false
+            }
+            if (ok) return true
+        }
+        // Fallback: Nearby may already keep the bytes in a normal file.
+        val source = try {
+            filePart.asJavaFile()
+        } catch (e: Exception) {
+            null
+        }
+        if (source != null && source.exists()) {
+            return try {
+                source.copyTo(dest, overwrite = true)
+                dest.length() > 0
+            } catch (e: Exception) {
+                false
+            }
+        }
+        return false
+    }
+
+    /** Reads the length of an audio file, in seconds. 0 when unknown. */
+    private fun fileDurationSeconds(file: File): Int {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(file.absolutePath)
+            val millis = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+            (millis / 1000).toInt()
+        } catch (e: Exception) {
+            0
+        } finally {
+            try {
+                retriever.release()
+            } catch (ignored: Exception) {
+                // Nothing to clean up then.
             }
         }
     }
@@ -289,5 +431,7 @@ class ChatManager(
         private const val MESSAGE_ID_PREFIX = "#ID#"
         private const val MESSAGE_ID_LENGTH = 36 // length of a UUID string
         private const val MAX_SEEN_MESSAGE_IDS = 200
+        private const val VOICE_PREFIX = "#VOICE#"
+        private const val VOICE_DIR_NAME = "voice"
     }
 }

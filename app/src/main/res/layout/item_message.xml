@@ -17,6 +17,32 @@
         android:paddingEnd="14dp"
         android:paddingBottom="6dp">
 
+        <LinearLayout
+            android:id="@+id/voiceRow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:minWidth="130dp"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <ImageButton
+                android:id="@+id/buttonPlay"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:background="@android:color/transparent"
+                android:contentDescription="@string/play_voice"
+                android:src="@android:drawable/ic_media_play" />
+
+            <TextView
+                android:id="@+id/durationText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:textColor="@color/bubble_received_text"
+                android:textSize="15sp" />
+        </LinearLayout>
+
         <TextView
             android:id="@+id/messageText"
             android:layout_width="wrap_content"
