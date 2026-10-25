@@ -97,6 +97,19 @@
             android:text="🔒"
             android:textColor="@color/on_primary"
             android:textSize="15sp" />
+
+        <TextView
+            android:id="@+id/buttonFriends"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:clickable="true"
+            android:contentDescription="@string/friends"
+            android:focusable="true"
+            android:padding="8dp"
+            android:text="👥"
+            android:textColor="@color/on_primary"
+            android:textSize="15sp" />
     </LinearLayout>
 
     <LinearLayout

@@ -64,6 +64,16 @@ import java.util.UUID
  * out of the text stream here, like a location, and never shown as
  * a chat text. The hub also applies a reaction it relays, so its
  * own screen stays in step with the group.
+ *
+ * Friends: every phone a connection is made with is remembered in
+ * [FriendsStore] under its base name ([baseNameOf]), whichever side
+ * asked and whichever side accepted. [findFriend] then reconnects
+ * with one tap: it runs the ordinary search, and the first phone
+ * found whose base name is the friend's is asked to connect at
+ * once — the "smaller name asks" rule does not apply, because the
+ * user picked this exact person. Other phones found meanwhile are
+ * left alone (a normal search would have asked one of them). The
+ * search gives up after a while and reports [Listener.onFriendNotFound].
  */
 class ChatManager(
     context: Context,
@@ -137,6 +147,14 @@ class ChatManager(
 
         /** The connection dropped and an automatic retry is about to happen. */
         fun onReconnecting(attempt: Int, maxAttempts: Int) {}
+
+        /**
+         * A one-tap friend search ([findFriend]) ran out of time
+         * without finding the friend named [friendName]; the search
+         * has stopped. (This phone still advertises, so the friend
+         * can still find and ask us instead.)
+         */
+        fun onFriendNotFound(friendName: String) {}
 
         /**
          * One of our own sent messages finished transferring to the
@@ -305,6 +323,12 @@ class ChatManager(
     private var reconnectAttempts = 0
     private val reconnectRunnable = Runnable { start() }
 
+    // One-tap friend search state (see findFriend): the base name of
+    // the friend being looked for, or null when no friend search is
+    // running. The timeout ends a search that never finds them.
+    private var pendingFriendName: String? = null
+    private val friendSearchTimeout = Runnable { onFriendSearchTimedOut() }
+
     // Ids of messages we already showed, so a repeated delivery is dropped.
     private val seenMessageIds = LinkedHashSet<String>()
 
@@ -412,6 +436,45 @@ class ChatManager(
         reconnectAttempts = 0
         stopEverything()
         listener.onDisconnected()
+    }
+
+    /**
+     * Starts a one-tap search for the friend with this base name (see
+     * [baseNameOf] and the class comment). It is the ordinary [start]
+     * search underneath: the first phone found whose base name
+     * matches is asked to connect at once, and every other phone
+     * found meanwhile is left alone. Does nothing while connected.
+     *
+     * The pending name is set only after start() returns, because
+     * start() tidies up leftover state through [stopEverything] —
+     * which ends any friend search, this one included. (That is also
+     * how a plain Find press, which calls start() directly, cancels
+     * a friend search.) A phone that is hosting a group (even an
+     * empty one) never discovers, so there the search can only be
+     * answered the other way round: the friend finds our advertised
+     * host name and asks us.
+     */
+    fun findFriend(baseName: String) {
+        val name = baseName.trim()
+        if (name.isEmpty() || isConnected()) return
+        start()
+        pendingFriendName = name
+        handler.removeCallbacks(friendSearchTimeout)
+        handler.postDelayed(friendSearchTimeout, FRIEND_SEARCH_TIMEOUT_MS)
+    }
+
+    /** A friend search that never found its friend gives up here. */
+    private fun onFriendSearchTimedOut() {
+        val name = pendingFriendName ?: return
+        pendingFriendName = null
+        client.stopDiscovery()
+        listener.onFriendNotFound(name)
+    }
+
+    /** Ends any running friend search; the search's timeout too. */
+    private fun clearFriendSearch() {
+        pendingFriendName = null
+        handler.removeCallbacks(friendSearchTimeout)
     }
 
     /** Who an outgoing message goes to: for the host everyone in the
@@ -687,6 +750,10 @@ class ChatManager(
 
     private fun stopEverything() {
         handler.removeCallbacks(reconnectRunnable)
+        // Every full stop ends a friend search too: disconnect(),
+        // fail(), and the fresh start() behind a plain Find press
+        // all come through here.
+        clearFriendSearch()
         role = Role.NONE
         connectedEndpoints.clear()
         pendingRequestId = null
@@ -736,6 +803,28 @@ class ChatManager(
 
     /** The endpoint name without the host marker, for showing to the user. */
     private fun visibleName(rawName: String): String = rawName.removePrefix(HUB_NAME_PREFIX)
+
+    /**
+     * The person's own name inside an endpoint name: the host marker
+     * taken off (see [visibleName]) and the random suffix that
+     * [buildLocalName] adds — a "-" plus four digits at the very end
+     * — taken off too. This is the name the friends list remembers
+     * and matches on, because the suffix changes on every connection
+     * while the base name is the person's own. An endpoint name with
+     * no such suffix (nothing this app version sends) keeps its whole
+     * visible name.
+     */
+    private fun baseNameOf(endpointName: String): String {
+        val visible = visibleName(endpointName)
+        val dash = visible.lastIndexOf('-')
+        if (dash > 0) {
+            val suffix = visible.substring(dash + 1)
+            if (suffix.length == 4 && suffix.all { it.isDigit() }) {
+                return visible.substring(0, dash)
+            }
+        }
+        return visible
+    }
 
     // ----- Join requests (accept dialog, one at a time) -----
 
@@ -807,6 +896,33 @@ class ChatManager(
                 return
             }
 
+            // A friend search (see findFriend) is aimed at one
+            // person: only a phone whose base name is the friend's is
+            // asked — at once, whichever name is "smaller", because
+            // the user picked this exact person — and every other
+            // phone found meanwhile is left alone.
+            val friend = pendingFriendName
+            if (friend != null) {
+                if (baseNameOf(info.endpointName) == friend) {
+                    clearFriendSearch()
+                    client.stopDiscovery()
+                    pendingRequestId = endpointId
+                    pendingNames[endpointId] = visibleName(info.endpointName)
+                    client.requestConnection(localName, endpointId, connectionCallback)
+                        .addOnFailureListener { e ->
+                            pendingRequestId = null
+                            pendingNames.remove(endpointId)
+                            if (reconnectAttempts > 0) {
+                                // A reconnect attempt failed; try again or give up.
+                                scheduleReconnectOrGiveUp()
+                            } else {
+                                fail(describe(e))
+                            }
+                        }
+                }
+                return
+            }
+
             // Only the phone with the "smaller" name sends the request,
             // so the two phones do not request each other at once. The
             // host's marked name always sorts last, so a searching phone
@@ -874,6 +990,13 @@ class ChatManager(
             val name = pendingNames.remove(endpointId) ?: ""
 
             if (code == ConnectionsStatusCodes.STATUS_OK) {
+                // A made connection ends any friend search (the
+                // friend was found, or someone else connected first),
+                // and the phone we just connected with is remembered
+                // as a friend under its base name — whichever side
+                // asked, whichever side accepted.
+                clearFriendSearch()
+                FriendsStore.record(appContext, baseNameOf(name))
                 // Whoever asked joins as a member; whoever accepted the
                 // first request becomes (or stays) the host.
                 role = when {
@@ -1640,6 +1763,8 @@ class ChatManager(
         private const val SERVICE_ID = "com.ashfaq.offlinechat.v1"
         private const val MAX_RECONNECT_ATTEMPTS = 3
         private const val RECONNECT_DELAY_MS = 3_000L
+        // How long a one-tap friend search looks before giving up.
+        private const val FRIEND_SEARCH_TIMEOUT_MS = 20_000L
         private const val MESSAGE_ID_PREFIX = "#ID#"
         private const val FROM_INFIX = "#FROM#"
         private const val MESSAGE_ID_LENGTH = 36 // length of a UUID string

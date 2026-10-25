@@ -44,6 +44,9 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 
 class MainActivity : AppCompatActivity(), ChatManager.Listener {
@@ -72,6 +75,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private lateinit var buttonTheme: TextView
     private lateinit var buttonCancelQuote: ImageButton
     private lateinit var buttonLock: TextView
+    private lateinit var buttonFriends: TextView
     private lateinit var lockOverlay: View
     private lateinit var lockTitle: TextView
     private lateinit var lockHint: TextView
@@ -210,6 +214,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonTheme = findViewById(R.id.buttonTheme)
         buttonCancelQuote = findViewById(R.id.buttonCancelQuote)
         buttonLock = findViewById(R.id.buttonLock)
+        buttonFriends = findViewById(R.id.buttonFriends)
         lockOverlay = findViewById(R.id.lockOverlay)
         lockTitle = findViewById(R.id.lockTitle)
         lockHint = findViewById(R.id.lockHint)
@@ -289,6 +294,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonPhoto.setOnClickListener { onPhotoClicked() }
         buttonFile.setOnClickListener { onFileClicked() }
         buttonLocation.setOnClickListener { onLocationClicked() }
+        buttonFriends.setOnClickListener { showFriendsDialog() }
         buttonName.setOnClickListener { showNameDialog() }
         buttonClearChat.setOnClickListener { confirmClearChat() }
         buttonCancelQuote.setOnClickListener { clearPendingQuote() }
@@ -379,6 +385,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
         buttonSearch.setTextColor(AppColors.headerText(this))
         buttonLock.setTextColor(AppColors.headerText(this))
+        buttonFriends.setTextColor(AppColors.headerText(this))
         searchBar.setBackgroundColor(AppColors.inputBarBackground(this))
         editSearch.setBackgroundResource(AppColors.inputFieldDrawable(this))
         editSearch.setTextColor(AppColors.textPrimary(this))
@@ -443,6 +450,71 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             permissionLauncher.launch(missing.toTypedArray())
         }
     }
+
+    // ---------- Friends ----------
+
+    /**
+     * The 👥 header button: the people this phone has connected with
+     * before, newest first, each with the last time they connected.
+     * Tapping one looks for that person and asks them to connect
+     * (see [onFriendClicked]). Nobody remembered yet gets a short
+     * explanation instead of an empty list.
+     */
+    private fun showFriendsDialog() {
+        if (closing) return
+        val friends = FriendsStore.list(this)
+        if (friends.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.friends_title)
+                .setMessage(R.string.friends_empty)
+                .setPositiveButton(android.R.string.ok, null)
+                .show()
+            return
+        }
+        val labels = friends.map { (name, lastConnected) ->
+            getString(
+                R.string.friend_last_connected,
+                name,
+                formatFriendTime(lastConnected)
+            )
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle(R.string.friends_title)
+            .setItems(labels) { _, which -> onFriendClicked(friends[which].first) }
+            .setNegativeButton(R.string.friends_close, null)
+            .show()
+    }
+
+    /**
+     * A friend was tapped: look for them and let ChatManager ask
+     * them to connect as soon as they are found. Like the Find
+     * button, the Nearby permissions must be in place first — when
+     * they are missing, the permission ask runs and the user taps
+     * the friend again afterwards (the same shape as location
+     * sharing). ChatManager's search reports "Searching..." through
+     * onSearching while it starts; the "Looking for..." line below
+     * is set after that, so it is the one that stays on screen.
+     */
+    private fun onFriendClicked(name: String) {
+        if (chatManager.isConnected()) {
+            Toast.makeText(this, R.string.status_connected_already, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val missing = requiredPermissions().filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            permissionLauncher.launch(missing.toTypedArray())
+            return
+        }
+        chatManager.findFriend(name)
+        setStatus(getString(R.string.friend_looking, name), R.color.status_idle)
+    }
+
+    /** "5 Oct, 3:42 PM" — when a friend was last connected with. */
+    private fun formatFriendTime(epochMillis: Long): String =
+        SimpleDateFormat("d MMM, h:mm a", Locale.getDefault())
+            .format(Date(epochMillis))
 
     private fun sendCurrentMessage() {
         val text = editMessage.text.toString().trim()
@@ -1600,6 +1672,13 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             getString(R.string.status_reconnecting, attempt, maxAttempts),
             R.color.status_idle
         )
+    }
+
+    override fun onFriendNotFound(friendName: String) {
+        if (closing) return
+        val message = getString(R.string.friend_not_found, friendName)
+        setStatus(message, R.color.status_idle)
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     override fun onMessageReceived(

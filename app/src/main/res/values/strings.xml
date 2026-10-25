@@ -97,4 +97,12 @@
 <string name="pin_must_be_4">PIN must be exactly 4 digits</string>
 <string name="pin_mismatch">The two PINs do not match</string>
 
+<string name="friends">Friends</string>
+<string name="friends_title">Friends</string>
+<string name="friends_empty">No friends yet. Connect with someone first — they will be remembered here.</string>
+<string name="friends_close">Close</string>
+<string name="friend_last_connected">%1$s — last connected %2$s</string>
+<string name="friend_looking">Looking for %1$s...</string>
+<string name="friend_not_found">%1$s not found nearby — make sure their app is open.</string>
+
 </resources>
