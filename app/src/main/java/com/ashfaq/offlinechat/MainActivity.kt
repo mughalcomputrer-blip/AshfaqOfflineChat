@@ -84,18 +84,6 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     // PIN gate lets the user through — and this is the guard.
     private var appStarted = false
 
-    companion object {
-        /**
-         * Whether this process has already passed the PIN gate.
-         * Static on purpose: recreate() for the dark-mode toggle
-         * builds a new activity in the same process and must not
-         * demand the PIN again mid-session, while a genuinely fresh
-         * app start (a new process — including after Android killed
-         * the backgrounded app) starts locked again when a PIN is set.
-         */
-        private var sessionUnlocked = false
-    }
-
     private var requestDialog: AlertDialog? = null
     private var closing = false
 
@@ -1782,6 +1770,16 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     }
 
     companion object {
+        /**
+         * Whether this process has already passed the PIN gate.
+         * Static on purpose: recreate() for the dark-mode toggle
+         * builds a new activity in the same process and must not
+         * demand the PIN again mid-session, while a genuinely fresh
+         * app start (a new process — including after Android killed
+         * the backgrounded app) starts locked again when a PIN is set.
+         */
+        private var sessionUnlocked = false
+
         private const val MAX_RECORDING_MS = 120_000L // 2 minutes
         private const val MAX_RECORDING_SECONDS = 120
         private const val MAX_PHOTO_DIMENSION = 1600 // pixels, longest side
