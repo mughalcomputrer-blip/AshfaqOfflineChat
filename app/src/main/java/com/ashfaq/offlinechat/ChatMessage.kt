@@ -21,6 +21,12 @@ data class ChatMessage(
     // received messages that carried a name; our own messages and
     // messages from older app versions have none.
     val senderName: String? = null,
+    // The message this one replies to, when it was sent as a reply:
+    // the quoted message's author name and a short preview of it (a
+    // text snippet, or a label like "📷 Photo"). Both are null when
+    // this is not a reply; they are always set (or unset) together.
+    val quotedSender: String? = null,
+    val quotedText: String? = null,
     // Local-only bookkeeping for our own sent messages (never put on
     // the wire): an id this app hands out when the message is sent, so
     // a finished transfer can be matched back to this chat row, and

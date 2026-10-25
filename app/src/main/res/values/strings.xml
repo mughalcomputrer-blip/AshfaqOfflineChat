@@ -42,6 +42,13 @@
 <string name="error_generic">Error: %1$s</string>
 <string name="error_hint">Make sure Bluetooth and Location are turned on, and that the other phone is also searching.</string>
 
+<string name="reply">Reply</string>
+<string name="quote_friend">Friend</string>
+<string name="quote_voice_preview">🎙 Voice message (%1$s)</string>
+<string name="quote_photo_preview">📷 Photo</string>
+<string name="quote_file_preview">📄 %1$s</string>
+<string name="cancel_reply">Cancel reply</string>
+
 <string name="your_name">Name</string>
 <string name="clear_chat">Clear</string>
 <string name="name_dialog_title">Your display name</string>

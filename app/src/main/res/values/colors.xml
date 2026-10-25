@@ -18,6 +18,12 @@
     <color name="bubble_received_text">#1C2733</color>
     <color name="bubble_received_stroke">#DFE6EE</color>
 
+    <!-- The quote strip inside a reply bubble: a slightly darker teal on
+         our own bubbles, a soft grey-blue on received ones. -->
+    <color name="quote_sent_bg">#0D9E8B</color>
+    <color name="quote_sent_text">#E6FFFFFF</color>
+    <color name="quote_received_bg">#E9EFF5</color>
+
     <color name="input_bar_background">#FFFFFF</color>
     <color name="input_stroke">#D9E1EA</color>
 

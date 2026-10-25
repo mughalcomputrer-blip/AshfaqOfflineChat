@@ -38,6 +38,12 @@ import java.util.UUID
  * receives and passes it on to the other spokes, so everyone in the
  * group sees every message. Every payload carries the name of the
  * person who originally sent it, so phones can label who said what.
+ *
+ * Replies: a message can quote an earlier one. A text reply carries the
+ * quote inside its own payload (so the hub's relay keeps it for free);
+ * a voice, photo or file reply is preceded by a tiny "#RPLY#" text
+ * holding the quote, paired with the file that follows it in the same
+ * per-endpoint way as the file info texts.
  */
 class ChatManager(
     context: Context,
@@ -62,8 +68,17 @@ class ChatManager(
          */
         fun onGroupHostUpdate(connectedCount: Int) {}
 
-        /** [senderName] is who originally wrote the message (null if unknown). */
-        fun onMessageReceived(text: String, senderName: String?)
+        /**
+         * [senderName] is who originally wrote the message (null if
+         * unknown). [quotedSender]/[quotedText] describe the message
+         * this one replies to (both null when it is not a reply).
+         */
+        fun onMessageReceived(
+            text: String,
+            senderName: String?,
+            quotedSender: String?,
+            quotedText: String?
+        )
         fun onError(message: String)
 
         /** The connection dropped and an automatic retry is about to happen. */
@@ -81,11 +96,18 @@ class ChatManager(
         fun onVoiceMessageReceived(
             filePath: String,
             durationSeconds: Int,
-            senderName: String?
+            senderName: String?,
+            quotedSender: String?,
+            quotedText: String?
         ) {}
 
         /** A photo arrived; [filePath] points to our own copy of it. */
-        fun onPhotoMessageReceived(filePath: String, senderName: String?) {}
+        fun onPhotoMessageReceived(
+            filePath: String,
+            senderName: String?,
+            quotedSender: String?,
+            quotedText: String?
+        ) {}
 
         /**
          * A file arrived; [filePath] points to our own copy of it, saved
@@ -95,7 +117,9 @@ class ChatManager(
             filePath: String,
             fileName: String,
             fileSizeBytes: Long,
-            senderName: String?
+            senderName: String?,
+            quotedSender: String?,
+            quotedText: String?
         ) {}
     }
 
@@ -145,6 +169,32 @@ class ChatManager(
     private fun wireSenderName(): String =
         displayBaseName().replace('#', ' ').trim()
             .take(MAX_SENDER_NAME_LENGTH).trim()
+
+    /**
+     * Makes a value safe to put inside one of the '#' separated payload
+     * formats: '#' and line breaks (which would break the field layout)
+     * become spaces, and the value is capped in length. Quote fields go
+     * through this, so the reading side can always split on '#' safely —
+     * a quoted preview that itself contains '#' loses only those '#'
+     * characters, never its place in the format.
+     */
+    private fun wireQuoteField(value: String, maxLength: Int): String =
+        value.replace('#', ' ').replace('\n', ' ').replace('\r', ' ')
+            .trim().take(maxLength).trim()
+
+    /**
+     * The tiny reply info sent just before a voice, photo or file send
+     * that carries a quote: "#RPLY#" + quoted sender + "#" + quoted
+     * preview. Null when there is no quote. Text messages do not use
+     * this; their quote rides inside the text payload itself.
+     */
+    private fun replyInfo(quotedSender: String?, quotedText: String?): String? {
+        if (quotedSender == null || quotedText == null) return null
+        val sender = wireQuoteField(quotedSender, MAX_SENDER_NAME_LENGTH)
+        val preview = wireQuoteField(quotedText, MAX_QUOTED_TEXT_LENGTH)
+        if (sender.isEmpty() || preview.isEmpty()) return null
+        return REPLY_PREFIX + sender + "#" + preview
+    }
 
     // ----- Group state -----
 
@@ -211,6 +261,16 @@ class ChatManager(
         val senderName: String?
     )
     private val pendingFiles = mutableMapOf<String, PendingFileInfo>()
+
+    // A quote that arrived (as a small "#RPLY#" text) just before a
+    // voice, photo or file from the same phone and belongs to that
+    // file's message. Kept per sending endpoint, exactly like
+    // [pendingFiles]: it is used when the file's transfer finishes,
+    // and dropped together with the file info when the transfer fails
+    // or the phone leaves, so a quote can never stick to a later,
+    // unrelated file.
+    private data class PendingQuote(val sender: String, val text: String)
+    private val pendingQuotes = mutableMapOf<String, PendingQuote>()
 
     fun isConnected(): Boolean = connectedEndpoints.isNotEmpty()
 
@@ -282,8 +342,16 @@ class ChatManager(
      * Sends a text message. [localId] is the sender app's own id for
      * this message (0 = do not track); when the transfer to the next
      * phone finishes, the listener hears about it via onMessageDelivered.
+     * When [quotedSender] and [quotedText] are both given, the message
+     * is a reply and carries that quote inside the payload (after the
+     * sender-name section), so the host's word-for-word relay keeps it.
      */
-    fun sendMessage(text: String, localId: Long = 0): Boolean {
+    fun sendMessage(
+        text: String,
+        localId: Long = 0,
+        quotedSender: String? = null,
+        quotedText: String? = null
+    ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
         // Every message carries its own random id, so the other phones can
@@ -292,12 +360,20 @@ class ChatManager(
         // Old format "#ID#" + uuid + text still works on the other side.
         val id = UUID.randomUUID().toString()
         val name = wireSenderName()
-        val wireText = if (name.isEmpty()) {
-            MESSAGE_ID_PREFIX + id + text
-        } else {
-            MESSAGE_ID_PREFIX + id + FROM_INFIX + name + "#" + text
+        val wire = StringBuilder(MESSAGE_ID_PREFIX).append(id)
+        if (name.isNotEmpty()) {
+            wire.append(FROM_INFIX).append(name).append('#')
         }
-        val payload = Payload.fromBytes(wireText.toByteArray(Charsets.UTF_8))
+        if (quotedSender != null && quotedText != null) {
+            val qSender = wireQuoteField(quotedSender, MAX_SENDER_NAME_LENGTH)
+            val qText = wireQuoteField(quotedText, MAX_QUOTED_TEXT_LENGTH)
+            if (qSender.isNotEmpty() && qText.isNotEmpty()) {
+                wire.append(QUOTE_NAME_INFIX).append(qSender)
+                    .append(QUOTE_TEXT_INFIX).append(qText).append('#')
+            }
+        }
+        wire.append(text)
+        val payload = Payload.fromBytes(wire.toString().toByteArray(Charsets.UTF_8))
         if (localId != 0L) outgoingPayloads[payload.id] = localId
         client.sendPayload(targets, payload)
             .addOnFailureListener { e -> listener.onError(describe(e)) }
@@ -309,7 +385,13 @@ class ChatManager(
      * info, so we first send a tiny text info ("#VOICE#" + seconds + "#" +
      * sender name + "#" + file name) and then the audio file itself.
      */
-    fun sendVoiceMessage(file: File, durationSeconds: Int, localId: Long = 0): Boolean {
+    fun sendVoiceMessage(
+        file: File,
+        durationSeconds: Int,
+        localId: Long = 0,
+        quotedSender: String? = null,
+        quotedText: String? = null
+    ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
         val name = wireSenderName()
@@ -319,7 +401,9 @@ class ChatManager(
             VOICE_PREFIX + durationSeconds + "#" + name + "#" + file.name
         }
         return sendInfoAndFile(
-            targets, info, file, "The voice message could not be sent.", localId
+            targets, info, file,
+            "The voice message could not be sent.", localId,
+            replyInfo(quotedSender, quotedText)
         )
     }
 
@@ -328,7 +412,12 @@ class ChatManager(
      * extra info, so we first send a tiny text info ("#PHOTO#" + sender
      * name + "#" + file name) and then the image file itself.
      */
-    fun sendPhotoMessage(file: File, localId: Long = 0): Boolean {
+    fun sendPhotoMessage(
+        file: File,
+        localId: Long = 0,
+        quotedSender: String? = null,
+        quotedText: String? = null
+    ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
         val name = wireSenderName()
@@ -338,7 +427,9 @@ class ChatManager(
             PHOTO_PREFIX + name + "#" + file.name
         }
         return sendInfoAndFile(
-            targets, info, file, "The photo could not be sent.", localId
+            targets, info, file,
+            "The photo could not be sent.", localId,
+            replyInfo(quotedSender, quotedText)
         )
     }
 
@@ -349,7 +440,12 @@ class ChatManager(
      * name) and then the file itself. The file must already carry its
      * final name, because that name is what the other phones save and show.
      */
-    fun sendFileMessage(file: File, localId: Long = 0): Boolean {
+    fun sendFileMessage(
+        file: File,
+        localId: Long = 0,
+        quotedSender: String? = null,
+        quotedText: String? = null
+    ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
         val name = wireSenderName()
@@ -359,7 +455,9 @@ class ChatManager(
             FILE_PREFIX + name + "#" + file.name
         }
         return sendInfoAndFile(
-            targets, info, file, "The file could not be sent.", localId
+            targets, info, file,
+            "The file could not be sent.", localId,
+            replyInfo(quotedSender, quotedText)
         )
     }
 
@@ -372,13 +470,18 @@ class ChatManager(
      * stays 0 because the file is not the host's own message).
      * When [localId] is not 0, the FILE payload (not the info text) is
      * what counts for the "delivered" ticks of our own message.
+     * When the message is a reply, [replyInfoText] (built by [replyInfo])
+     * goes first, before the info text, so the receiving side can hold
+     * it next to the file info. It is only sent once the file payload
+     * exists, so a send that cannot even start sends nothing at all.
      */
     private fun sendInfoAndFile(
         targets: List<String>,
         info: String,
         file: File,
         errorMessage: String?,
-        localId: Long = 0
+        localId: Long = 0,
+        replyInfoText: String? = null
     ): Boolean {
         if (targets.isEmpty()) return false
         val filePayload = try {
@@ -388,6 +491,11 @@ class ChatManager(
             return false
         }
         if (localId != 0L) outgoingPayloads[filePayload.id] = localId
+        if (replyInfoText != null) {
+            client.sendPayload(
+                targets, Payload.fromBytes(replyInfoText.toByteArray(Charsets.UTF_8))
+            ).addOnFailureListener { e -> listener.onError(describe(e)) }
+        }
         client.sendPayload(targets, Payload.fromBytes(info.toByteArray(Charsets.UTF_8)))
             .addOnFailureListener { e -> listener.onError(describe(e)) }
         client.sendPayload(targets, filePayload)
@@ -407,6 +515,7 @@ class ChatManager(
         incomingFilePayloads.clear()
         filePayloadEndpoints.clear()
         pendingFiles.clear()
+        pendingQuotes.clear()
         // Transfers that never finished will never report now; their
         // messages simply keep the single "sent" tick.
         outgoingPayloads.clear()
@@ -628,9 +737,11 @@ class ChatManager(
 
             if (!connectedEndpoints.containsKey(endpointId)) return
             connectedEndpoints.remove(endpointId)
-            // The phone is gone, so the info about a file it was sending
-            // and any half-arrived file of it are stale now.
+            // The phone is gone, so the info about a file it was sending,
+            // any quote waiting for that file, and any half-arrived file
+            // of it are stale now.
             pendingFiles.remove(endpointId)
+            pendingQuotes.remove(endpointId)
             val iterator = filePayloadEndpoints.entries.iterator()
             while (iterator.hasNext()) {
                 val entry = iterator.next()
@@ -669,6 +780,19 @@ class ChatManager(
                 Payload.Type.BYTES -> {
                     val bytes = payload.asBytes() ?: return
                     val raw = String(bytes, Charsets.UTF_8)
+                    if (raw.startsWith(REPLY_PREFIX)) {
+                        // The quote belonging to the voice, photo or
+                        // file this phone is about to send. It is held
+                        // until that file's transfer finishes; text
+                        // messages carry their quote inside themselves,
+                        // so this is never one of those. A malformed one
+                        // is simply dropped — it is a control text, not
+                        // a chat message.
+                        parseReplyInfo(raw)?.let {
+                            pendingQuotes[endpointId] = it
+                        }
+                        return
+                    }
                     if (raw.startsWith(VOICE_PREFIX)) {
                         // Info about the voice file that follows.
                         parseVoiceInfo(raw)?.let {
@@ -694,7 +818,10 @@ class ChatManager(
                     if (message.id != null && !rememberMessageId(message.id)) {
                         return // We already showed this message once.
                     }
-                    listener.onMessageReceived(message.text, message.senderName)
+                    listener.onMessageReceived(
+                        message.text, message.senderName,
+                        message.quotedSender, message.quotedText
+                    )
                     if (role == Role.HUB) {
                         // The host passes every member's message on to the
                         // rest of the group, word for word (same id, same
@@ -725,8 +852,10 @@ class ChatManager(
                 // is the same feedback as before).
                 outgoingPayloads.remove(update.payloadId)
                 if (wasIncoming) {
-                    // The file is gone, so its info message is stale too.
+                    // The file is gone, so its info message — and any
+                    // quote waiting for it — are stale too.
                     pendingFiles.remove(endpointId)
+                    pendingQuotes.remove(endpointId)
                 }
                 listener.onError("A message could not be transferred.")
             } else if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
@@ -743,35 +872,43 @@ class ChatManager(
                 if (filePayload != null) {
                     // The info message said what kind of file this is. No
                     // info (or a lost one) keeps the old behavior: voice.
+                    // A quote that was sent just before the file belongs
+                    // to this message and is used up now.
                     val info = pendingFiles.remove(endpointId)
+                    val quote = pendingQuotes.remove(endpointId)
                     when (info?.kind ?: IncomingFileKind.VOICE) {
                         IncomingFileKind.VOICE -> {
                             val dest = saveReceivedVoiceFile(filePayload) ?: return
                             val duration = info?.voiceDurationSeconds
                                 ?: fileDurationSeconds(dest)
                             listener.onVoiceMessageReceived(
-                                dest.absolutePath, duration, info?.senderName
+                                dest.absolutePath, duration, info?.senderName,
+                                quote?.sender, quote?.text
                             )
                             if (role == Role.HUB) {
-                                relayVoiceFile(dest, duration, info?.senderName, endpointId)
+                                relayVoiceFile(
+                                    dest, duration, info?.senderName, endpointId, quote
+                                )
                             }
                         }
                         IncomingFileKind.PHOTO -> {
                             val dest = saveReceivedPhotoFile(filePayload) ?: return
                             listener.onPhotoMessageReceived(
-                                dest.absolutePath, info?.senderName
+                                dest.absolutePath, info?.senderName,
+                                quote?.sender, quote?.text
                             )
                             if (role == Role.HUB) {
-                                relayPhotoFile(dest, info?.senderName, endpointId)
+                                relayPhotoFile(dest, info?.senderName, endpointId, quote)
                             }
                         }
                         IncomingFileKind.FILE -> {
                             val dest = saveReceivedFile(filePayload, info?.fileName) ?: return
                             listener.onFileMessageReceived(
-                                dest.absolutePath, dest.name, dest.length(), info?.senderName
+                                dest.absolutePath, dest.name, dest.length(),
+                                info?.senderName, quote?.sender, quote?.text
                             )
                             if (role == Role.HUB) {
-                                relayFile(dest, info?.senderName, endpointId)
+                                relayFile(dest, info?.senderName, endpointId, quote)
                             }
                         }
                     }
@@ -789,7 +926,8 @@ class ChatManager(
         file: File,
         durationSeconds: Int,
         senderName: String?,
-        exceptEndpointId: String
+        exceptEndpointId: String,
+        quote: PendingQuote? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -798,13 +936,17 @@ class ChatManager(
         } else {
             VOICE_PREFIX + durationSeconds + "#" + senderName + "#" + file.name
         }
-        sendInfoAndFile(targets, info, file, null)
+        sendInfoAndFile(
+            targets, info, file, null, 0,
+            replyInfo(quote?.sender, quote?.text)
+        )
     }
 
     private fun relayPhotoFile(
         file: File,
         senderName: String?,
-        exceptEndpointId: String
+        exceptEndpointId: String,
+        quote: PendingQuote? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -813,13 +955,17 @@ class ChatManager(
         } else {
             PHOTO_PREFIX + senderName + "#" + file.name
         }
-        sendInfoAndFile(targets, info, file, null)
+        sendInfoAndFile(
+            targets, info, file, null, 0,
+            replyInfo(quote?.sender, quote?.text)
+        )
     }
 
     private fun relayFile(
         file: File,
         senderName: String?,
-        exceptEndpointId: String
+        exceptEndpointId: String,
+        quote: PendingQuote? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -828,7 +974,27 @@ class ChatManager(
         } else {
             FILE_PREFIX + senderName + "#" + file.name
         }
-        sendInfoAndFile(targets, info, file, null)
+        sendInfoAndFile(
+            targets, info, file, null, 0,
+            replyInfo(quote?.sender, quote?.text)
+        )
+    }
+
+    /**
+     * Reads a reply info text: "#RPLY#" + quoted sender + "#" + quoted
+     * preview (split at the FIRST '#'; the sender never contains one,
+     * because [wireQuoteField] removed it on the sending side). Null
+     * when either part is missing or empty — such a text is a control
+     * text gone wrong and is dropped, never shown as a chat message.
+     */
+    private fun parseReplyInfo(raw: String): PendingQuote? {
+        val rest = raw.substring(REPLY_PREFIX.length)
+        val separator = rest.indexOf('#')
+        if (separator <= 0) return null
+        val sender = rest.substring(0, separator)
+        val preview = rest.substring(separator + 1)
+        if (preview.isEmpty()) return null
+        return PendingQuote(sender, preview)
     }
 
     /**
@@ -1015,15 +1181,24 @@ class ChatManager(
     private data class UnpackedMessage(
         val id: String?,
         val senderName: String?,
-        val text: String
+        val text: String,
+        val quotedSender: String? = null,
+        val quotedText: String? = null
     )
 
     /**
-     * Splits a received payload into its message id, the sender's name
-     * and the real text. New messages look like "#ID#" + a 36-char UUID +
-     * "#FROM#" + sender name + "#" + the text. Older messages have no
-     * "#FROM#" part (the name is then unknown), and a plain payload with
-     * no id at all (from a very old app version) is shown as-is.
+     * Splits a received payload into its message id, the sender's name,
+     * its quote (when it is a reply) and the real text. New messages
+     * look like "#ID#" + a 36-char UUID + "#FROM#" + sender name + "#" +
+     * the text; a reply inserts "#QNAME#" + quoted sender + "#QTEXT#" +
+     * quoted preview + "#" between the name and the text. The fields
+     * are read in that fixed order and each ends at the next '#', which
+     * is unambiguous because the sending side strips '#' out of every
+     * field. Older messages have no "#FROM#" part (the name is then
+     * unknown) and no quote part; when the quote part does not parse
+     * completely, the message is shown without a quote and the text is
+     * kept whole. A plain payload with no id at all (from a very old app
+     * version) is shown as-is.
      */
     private fun unpackMessage(raw: String): UnpackedMessage {
         val idStart = MESSAGE_ID_PREFIX.length
@@ -1045,7 +1220,26 @@ class ChatManager(
                     }
                     // No closing '#' at all: malformed; keep rest as-is.
                 }
-                return UnpackedMessage(id, senderName, rest)
+                var quotedSender: String? = null
+                var quotedText: String? = null
+                if (rest.startsWith(QUOTE_NAME_INFIX)) {
+                    val afterName = rest.substring(QUOTE_NAME_INFIX.length)
+                    val quoteTextIndex = afterName.indexOf(QUOTE_TEXT_INFIX)
+                    if (quoteTextIndex > 0) {
+                        val afterQuoteText = afterName.substring(
+                            quoteTextIndex + QUOTE_TEXT_INFIX.length
+                        )
+                        val end = afterQuoteText.indexOf('#')
+                        if (end > 0) {
+                            quotedSender = afterName.substring(0, quoteTextIndex)
+                            quotedText = afterQuoteText.substring(0, end)
+                            rest = afterQuoteText.substring(end + 1)
+                        }
+                    }
+                    // Incomplete quote section: not a quote; the whole
+                    // remaining text is kept, as older versions show it.
+                }
+                return UnpackedMessage(id, senderName, rest, quotedSender, quotedText)
             }
         }
         return UnpackedMessage(null, null, raw)
@@ -1071,6 +1265,15 @@ class ChatManager(
         private const val MESSAGE_ID_LENGTH = 36 // length of a UUID string
         private const val MAX_SEEN_MESSAGE_IDS = 200
         private const val MAX_SENDER_NAME_LENGTH = 40
+        // Reply/quote sections. In a text payload: "#QNAME#" + quoted
+        // sender + "#QTEXT#" + quoted preview + "#", right before the
+        // text. For voice, photo and file sends, one "#RPLY#" + quoted
+        // sender + "#" + quoted preview text goes just before the usual
+        // info text instead.
+        private const val QUOTE_NAME_INFIX = "#QNAME#"
+        private const val QUOTE_TEXT_INFIX = "#QTEXT#"
+        private const val REPLY_PREFIX = "#RPLY#"
+        private const val MAX_QUOTED_TEXT_LENGTH = 80
         private const val VOICE_PREFIX = "#VOICE#"
         private const val VOICE_DIR_NAME = "voice"
         private const val PHOTO_PREFIX = "#PHOTO#"

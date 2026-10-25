@@ -15,6 +15,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
+import android.view.View
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
@@ -40,9 +41,19 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private lateinit var buttonMic: ImageButton
     private lateinit var buttonPhoto: ImageButton
     private lateinit var buttonFile: ImageButton
+    private lateinit var quoteBar: View
+    private lateinit var quoteBarSender: TextView
+    private lateinit var quoteBarText: TextView
 
     private var requestDialog: AlertDialog? = null
     private var closing = false
+
+    // The quote chosen with a long press ("Reply"), waiting to ride
+    // along with the next message the user sends — text, voice, photo
+    // or file alike. Both stay null when no reply is pending; sending
+    // (or the ✕ on the quote bar) clears them again.
+    private var pendingQuotedSender: String? = null
+    private var pendingQuotedText: String? = null
 
     // Ids for our own sent messages, handed out one per message, so a
     // finished transfer can be matched back to its chat row (the
@@ -110,13 +121,18 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonMic = findViewById(R.id.buttonMic)
         buttonPhoto = findViewById(R.id.buttonPhoto)
         buttonFile = findViewById(R.id.buttonFile)
+        quoteBar = findViewById(R.id.quoteBar)
+        quoteBarSender = findViewById(R.id.quoteBarSender)
+        quoteBarText = findViewById(R.id.quoteBarText)
         val buttonFind: MaterialButton = findViewById(R.id.buttonFind)
         val buttonDisconnect: MaterialButton = findViewById(R.id.buttonDisconnect)
         val buttonSend: MaterialButton = findViewById(R.id.buttonSend)
         val buttonName: TextView = findViewById(R.id.buttonName)
         val buttonClearChat: TextView = findViewById(R.id.buttonClearChat)
+        val buttonCancelQuote: ImageButton = findViewById(R.id.buttonCancelQuote)
 
         adapter = MessageAdapter()
+        adapter.onReplyRequested = { message -> showReplyDialog(message) }
         recyclerMessages.layoutManager = LinearLayoutManager(this)
         recyclerMessages.adapter = adapter
 
@@ -140,6 +156,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonFile.setOnClickListener { onFileClicked() }
         buttonName.setOnClickListener { showNameDialog() }
         buttonClearChat.setOnClickListener { confirmClearChat() }
+        buttonCancelQuote.setOnClickListener { clearPendingQuote() }
     }
 
     override fun onDestroy() {
@@ -171,13 +188,97 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         val text = editMessage.text.toString().trim()
         if (text.isEmpty()) return
         val localId = nextLocalId++
-        if (!chatManager.sendMessage(text, localId)) {
+        if (!chatManager.sendMessage(
+                text, localId, pendingQuotedSender, pendingQuotedText
+            )
+        ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
             return
         }
-        addMessage(ChatMessage(text = text, isSent = true, localId = localId))
+        addMessage(
+            ChatMessage(
+                text = text,
+                isSent = true,
+                localId = localId,
+                quotedSender = pendingQuotedSender,
+                quotedText = pendingQuotedText
+            )
+        )
         editMessage.text.clear()
+        clearPendingQuote()
     }
+
+    // ---------- Replies ----------
+
+    /** The little menu shown when a message is long-pressed. */
+    private fun showReplyDialog(message: ChatMessage) {
+        if (closing) return
+        AlertDialog.Builder(this)
+            .setItems(arrayOf(getString(R.string.reply))) { _, _ ->
+                setPendingQuote(message)
+            }
+            .show()
+    }
+
+    /**
+     * Remembers [message] as the one being replied to and shows the
+     * quote bar above the input row. The quote goes out with the next
+     * message that is actually sent, whichever kind it is; a send that
+     * fails (for example while not connected) leaves it in place.
+     */
+    private fun setPendingQuote(message: ChatMessage) {
+        pendingQuotedSender = quoteAuthorOf(message)
+        pendingQuotedText = quotePreviewOf(message)
+        quoteBarSender.text = pendingQuotedSender
+        quoteBarText.text = pendingQuotedText
+        quoteBar.visibility = View.VISIBLE
+    }
+
+    /** Drops the pending reply and hides the quote bar. */
+    private fun clearPendingQuote() {
+        pendingQuotedSender = null
+        pendingQuotedText = null
+        quoteBar.visibility = View.GONE
+    }
+
+    /**
+     * The name a quote of [message] carries: the original author's
+     * display name. Our own messages are quoted under our own name (the
+     * other phones stamp it into the quote, exactly like the sender
+     * name of a normal message); a received message whose author is
+     * unknown (saved by an older app version) is quoted as "Friend".
+     */
+    private fun quoteAuthorOf(message: ChatMessage): String = when {
+        message.isSent -> chatManager.displayBaseName()
+        !message.senderName.isNullOrBlank() -> message.senderName
+        else -> getString(R.string.quote_friend)
+    }
+
+    /** The one-line preview a quote of [message] shows. */
+    private fun quotePreviewOf(message: ChatMessage): String = when (message.type) {
+        ChatMessage.Type.TEXT -> {
+            val oneLine = message.text.replace('\n', ' ').trim()
+            if (oneLine.length > QUOTE_PREVIEW_MAX_CHARS) {
+                oneLine.substring(0, QUOTE_PREVIEW_MAX_CHARS) + "…"
+            } else {
+                oneLine
+            }
+        }
+        ChatMessage.Type.VOICE ->
+            getString(R.string.quote_voice_preview, formatDuration(message.durationSeconds))
+        ChatMessage.Type.PHOTO -> getString(R.string.quote_photo_preview)
+        ChatMessage.Type.FILE -> getString(
+            R.string.quote_file_preview,
+            message.fileName ?: message.filePath?.let { File(it).name } ?: ""
+        )
+    }
+
+    /** "0:07" style, like the voice rows in the chat show it. */
+    private fun formatDuration(totalSeconds: Int): String =
+        String.format(
+            java.util.Locale.getDefault(), "%d:%02d",
+            totalSeconds / 60, totalSeconds % 60
+        )
 
     // ---------- Voice messages ----------
 
@@ -270,7 +371,11 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             return
         }
         val localId = nextLocalId++
-        if (!chatManager.sendVoiceMessage(file, durationSeconds, localId)) {
+        if (!chatManager.sendVoiceMessage(
+                file, durationSeconds, localId,
+                pendingQuotedSender, pendingQuotedText
+            )
+        ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
             return
         }
@@ -281,9 +386,12 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 type = ChatMessage.Type.VOICE,
                 audioPath = file.absolutePath,
                 durationSeconds = durationSeconds,
-                localId = localId
+                localId = localId,
+                quotedSender = pendingQuotedSender,
+                quotedText = pendingQuotedText
             )
         )
+        clearPendingQuote()
         setStatus(getString(R.string.voice_sent), R.color.status_connected)
     }
 
@@ -337,7 +445,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             return
         }
         val localId = nextLocalId++
-        if (!chatManager.sendPhotoMessage(file, localId)) {
+        if (!chatManager.sendPhotoMessage(
+                file, localId, pendingQuotedSender, pendingQuotedText
+            )
+        ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
             return
         }
@@ -347,9 +458,12 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 isSent = true,
                 type = ChatMessage.Type.PHOTO,
                 imagePath = file.absolutePath,
-                localId = localId
+                localId = localId,
+                quotedSender = pendingQuotedSender,
+                quotedText = pendingQuotedText
             )
         )
+        clearPendingQuote()
     }
 
     private fun createPreparedPhotoFile(uri: Uri): File? {
@@ -497,7 +611,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             }
         }
         val localId = nextLocalId++
-        if (!chatManager.sendFileMessage(file, localId)) {
+        if (!chatManager.sendFileMessage(
+                file, localId, pendingQuotedSender, pendingQuotedText
+            )
+        ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
             return
         }
@@ -509,9 +626,12 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 filePath = file.absolutePath,
                 fileName = file.name,
                 fileSizeBytes = file.length(),
-                localId = localId
+                localId = localId,
+                quotedSender = pendingQuotedSender,
+                quotedText = pendingQuotedText
             )
         )
+        clearPendingQuote()
     }
 
     /** How copying a picked file into the cache folder went. */
@@ -732,9 +852,22 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         )
     }
 
-    override fun onMessageReceived(text: String, senderName: String?) {
+    override fun onMessageReceived(
+        text: String,
+        senderName: String?,
+        quotedSender: String?,
+        quotedText: String?
+    ) {
         if (closing) return
-        addMessage(ChatMessage(text = text, isSent = false, senderName = senderName))
+        addMessage(
+            ChatMessage(
+                text = text,
+                isSent = false,
+                senderName = senderName,
+                quotedSender = quotedSender,
+                quotedText = quotedText
+            )
+        )
     }
 
     override fun onMessageDelivered(localId: Long) {
@@ -749,7 +882,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     override fun onVoiceMessageReceived(
         filePath: String,
         durationSeconds: Int,
-        senderName: String?
+        senderName: String?,
+        quotedSender: String?,
+        quotedText: String?
     ) {
         if (closing) return
         addMessage(
@@ -759,12 +894,19 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 type = ChatMessage.Type.VOICE,
                 audioPath = filePath,
                 durationSeconds = durationSeconds,
-                senderName = senderName
+                senderName = senderName,
+                quotedSender = quotedSender,
+                quotedText = quotedText
             )
         )
     }
 
-    override fun onPhotoMessageReceived(filePath: String, senderName: String?) {
+    override fun onPhotoMessageReceived(
+        filePath: String,
+        senderName: String?,
+        quotedSender: String?,
+        quotedText: String?
+    ) {
         if (closing) return
         addMessage(
             ChatMessage(
@@ -772,7 +914,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 isSent = false,
                 type = ChatMessage.Type.PHOTO,
                 imagePath = filePath,
-                senderName = senderName
+                senderName = senderName,
+                quotedSender = quotedSender,
+                quotedText = quotedText
             )
         )
     }
@@ -781,7 +925,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         filePath: String,
         fileName: String,
         fileSizeBytes: Long,
-        senderName: String?
+        senderName: String?,
+        quotedSender: String?,
+        quotedText: String?
     ) {
         if (closing) return
         addMessage(
@@ -792,7 +938,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 filePath = filePath,
                 fileName = fileName,
                 fileSizeBytes = fileSizeBytes,
-                senderName = senderName
+                senderName = senderName,
+                quotedSender = quotedSender,
+                quotedText = quotedText
             )
         )
     }
@@ -810,5 +958,6 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         private const val MAX_PHOTO_DIMENSION = 1600 // pixels, longest side
         private const val PHOTO_JPEG_QUALITY = 80
         private const val MAX_FILE_SIZE_BYTES = 100L * 1024 * 1024 // 100 MB
+        private const val QUOTE_PREVIEW_MAX_CHARS = 60
     }
 }

@@ -89,6 +89,9 @@ object ChatHistoryStore {
             message.fileName?.let { item.put("fname", it) }
             item.put("fsize", message.fileSizeBytes)
             message.senderName?.let { item.put("from", it) }
+            // The quote this message replies to, if any.
+            message.quotedSender?.let { item.put("qsender", it) }
+            message.quotedText?.let { item.put("qtext", it) }
             // The local id and the delivered ticks of our own messages,
             // so they survive a restart like the messages themselves.
             item.put("lid", message.localId)
@@ -118,6 +121,18 @@ object ChatHistoryStore {
         } else {
             item.optString("from").takeIf { it.isNotEmpty() }
         }
+        // Older history files have no quote keys either; their messages
+        // are simply not replies. A quote shows only with both parts.
+        val quotedSender = if (item.isNull("qsender")) {
+            null
+        } else {
+            item.optString("qsender").takeIf { it.isNotEmpty() }
+        }
+        val quotedText = if (item.isNull("qtext")) {
+            null
+        } else {
+            item.optString("qtext").takeIf { it.isNotEmpty() }
+        }
         // Older history files have no "lid"/"delivered" keys either;
         // those own messages then honestly show the single "sent" tick.
         // A voice, photo or file entry is only useful while its file is
@@ -143,6 +158,8 @@ object ChatHistoryStore {
             fileName = fileName,
             fileSizeBytes = item.optLong("fsize", 0L),
             senderName = senderName,
+            quotedSender = if (quotedText != null) quotedSender else null,
+            quotedText = quotedText,
             localId = item.optLong("lid", 0L),
             delivered = item.optBoolean("delivered", false)
         )

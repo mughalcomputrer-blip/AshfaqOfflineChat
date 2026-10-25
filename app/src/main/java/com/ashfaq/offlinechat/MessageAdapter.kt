@@ -30,6 +30,13 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     private val messages = mutableListOf<ChatMessage>()
     private val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
 
+    /**
+     * Called when the user long-presses a message and picks "Reply"
+     * (the screen shows the dialog and owns the reply state; the
+     * adapter only reports which message was chosen).
+     */
+    var onReplyRequested: ((ChatMessage) -> Unit)? = null
+
     // Voice playback state: at most one voice message plays at a time.
     private var mediaPlayer: MediaPlayer? = null
     private var playingAudioPath: String? = null
@@ -39,6 +46,10 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     class MessageViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val bubble: View = view.findViewById(R.id.bubbleView)
         val senderNameText: TextView = view.findViewById(R.id.senderNameText)
+        val quoteBlock: View = view.findViewById(R.id.quoteBlock)
+        val quoteStrip: View = view.findViewById(R.id.quoteStrip)
+        val quoteSenderText: TextView = view.findViewById(R.id.quoteSenderText)
+        val quoteText: TextView = view.findViewById(R.id.quoteText)
         val messageText: TextView = view.findViewById(R.id.messageText)
         val voiceRow: View = view.findViewById(R.id.voiceRow)
         val buttonPlay: ImageButton = view.findViewById(R.id.buttonPlay)
@@ -61,6 +72,17 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     override fun onBindViewHolder(holder: MessageViewHolder, position: Int) {
         val message = messages[position]
         val context = holder.itemView.context
+
+        // A long press on a message offers "Reply". The photo and the
+        // play button consume their own touches, so they get the same
+        // listener; everything else on the row reaches the bubble.
+        val replyOnLongClick = View.OnLongClickListener {
+            onReplyRequested?.invoke(message)
+            true
+        }
+        holder.bubble.setOnLongClickListener(replyOnLongClick)
+        holder.photoImage.setOnLongClickListener(replyOnLongClick)
+        holder.buttonPlay.setOnLongClickListener(replyOnLongClick)
 
         holder.messageText.text = message.text
         holder.timeText.text = timeFormat.format(Date(message.timestamp))
@@ -138,6 +160,44 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             )
         }
         holder.bubble.layoutParams = params
+
+        // When this message is a reply, a quote strip at the top of the
+        // bubble shows who was quoted and a preview of their message.
+        // Its colors follow the bubble side, like everything else here.
+        val quotedSender = message.quotedSender
+        val quotedText = message.quotedText
+        if (!quotedSender.isNullOrBlank() && !quotedText.isNullOrBlank()) {
+            holder.quoteBlock.visibility = View.VISIBLE
+            holder.quoteSenderText.text = quotedSender
+            holder.quoteText.text = quotedText
+            if (message.isSent) {
+                holder.quoteBlock.setBackgroundResource(R.drawable.bg_quote_sent)
+                holder.quoteStrip.setBackgroundColor(
+                    ContextCompat.getColor(context, R.color.on_primary)
+                )
+                holder.quoteSenderText.setTextColor(
+                    ContextCompat.getColor(context, R.color.bubble_sent_text)
+                )
+                holder.quoteText.setTextColor(
+                    ContextCompat.getColor(context, R.color.quote_sent_text)
+                )
+            } else {
+                holder.quoteBlock.setBackgroundResource(R.drawable.bg_quote_received)
+                holder.quoteStrip.setBackgroundColor(
+                    ContextCompat.getColor(context, R.color.accent)
+                )
+                holder.quoteSenderText.setTextColor(
+                    ContextCompat.getColor(context, R.color.accent)
+                )
+                holder.quoteText.setTextColor(
+                    ContextCompat.getColor(context, R.color.text_secondary)
+                )
+            }
+        } else {
+            holder.quoteBlock.visibility = View.GONE
+            holder.quoteSenderText.text = null
+            holder.quoteText.text = null
+        }
 
         when (message.type) {
             ChatMessage.Type.VOICE -> {
