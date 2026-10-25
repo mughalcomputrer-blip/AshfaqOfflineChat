@@ -89,6 +89,9 @@ object ChatHistoryStore {
             message.filePath?.let { item.put("file", it) }
             message.fileName?.let { item.put("fname", it) }
             item.put("fsize", message.fileSizeBytes)
+            // A shared position, for location messages.
+            message.latitude?.let { item.put("lat", it) }
+            message.longitude?.let { item.put("lng", it) }
             message.senderName?.let { item.put("from", it) }
             // The quote this message replies to, if any.
             message.quotedSender?.let { item.put("qsender", it) }
@@ -118,6 +121,10 @@ object ChatHistoryStore {
         // exactly as before.
         val filePath = if (item.isNull("file")) null else item.optString("file")
         val fileName = if (item.isNull("fname")) null else item.optString("fname")
+        // Older history files have no "lat"/"lng" keys; those entries
+        // are never of type LOCATION, so both simply stay null.
+        val latitude = if (item.isNull("lat")) null else item.optDouble("lat")
+        val longitude = if (item.isNull("lng")) null else item.optDouble("lng")
         // Older history files have no "from" key; those messages simply
         // have no sender name, exactly as they were saved.
         val senderName = if (item.isNull("from")) {
@@ -151,6 +158,8 @@ object ChatHistoryStore {
                 if (videoPath == null || !File(videoPath).exists()) return null
             ChatMessage.Type.FILE ->
                 if (filePath == null || !File(filePath).exists()) return null
+            // A location points at no file, so nothing can be missing.
+            ChatMessage.Type.LOCATION -> Unit
             ChatMessage.Type.TEXT -> Unit
         }
         return ChatMessage(
@@ -165,6 +174,8 @@ object ChatHistoryStore {
             filePath = filePath,
             fileName = fileName,
             fileSizeBytes = item.optLong("fsize", 0L),
+            latitude = latitude,
+            longitude = longitude,
             senderName = senderName,
             quotedSender = if (quotedText != null) quotedSender else null,
             quotedText = quotedText,

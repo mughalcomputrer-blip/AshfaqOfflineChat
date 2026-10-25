@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
+import android.net.Uri
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
@@ -64,6 +65,9 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val fileIcon: ImageView = view.findViewById(R.id.fileIcon)
         val fileNameText: TextView = view.findViewById(R.id.fileNameText)
         val fileSizeText: TextView = view.findViewById(R.id.fileSizeText)
+        val locationRow: View = view.findViewById(R.id.locationRow)
+        val locationTitleText: TextView = view.findViewById(R.id.locationTitleText)
+        val locationCoordsText: TextView = view.findViewById(R.id.locationCoordsText)
         val timeText: TextView = view.findViewById(R.id.timeText)
         val ticksText: TextView = view.findViewById(R.id.ticksText)
     }
@@ -143,6 +147,12 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.fileIcon.setColorFilter(
                 ContextCompat.getColor(context, R.color.bubble_sent_text)
             )
+            holder.locationTitleText.setTextColor(
+                ContextCompat.getColor(context, R.color.bubble_sent_text)
+            )
+            holder.locationCoordsText.setTextColor(
+                ContextCompat.getColor(context, R.color.bubble_sent_text)
+            )
         } else {
             params.gravity = Gravity.START
             holder.bubble.setBackgroundResource(AppColors.bubbleReceivedDrawable(context))
@@ -153,6 +163,8 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.fileNameText.setTextColor(AppColors.bubbleReceivedText(context))
             holder.fileSizeText.setTextColor(AppColors.textSecondary(context))
             holder.fileIcon.setColorFilter(AppColors.accent(context))
+            holder.locationTitleText.setTextColor(AppColors.bubbleReceivedText(context))
+            holder.locationCoordsText.setTextColor(AppColors.textSecondary(context))
         }
         holder.bubble.layoutParams = params
 
@@ -198,6 +210,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.videoContainer.visibility = View.GONE
                 holder.videoThumbnail.setOnClickListener(null)
                 holder.fileRow.visibility = View.GONE
+                holder.locationRow.visibility = View.GONE
                 holder.bubble.setOnClickListener(null)
                 holder.voiceRow.visibility = View.VISIBLE
                 holder.durationText.text = formatDuration(message.durationSeconds)
@@ -218,6 +231,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.videoContainer.visibility = View.GONE
                 holder.videoThumbnail.setOnClickListener(null)
                 holder.fileRow.visibility = View.GONE
+                holder.locationRow.visibility = View.GONE
                 holder.bubble.setOnClickListener(null)
                 holder.photoImage.visibility = View.VISIBLE
                 val path = message.imagePath
@@ -238,6 +252,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.photoImage.setOnClickListener(null)
                 holder.videoContainer.visibility = View.GONE
                 holder.videoThumbnail.setOnClickListener(null)
+                holder.locationRow.visibility = View.GONE
                 holder.fileRow.visibility = View.VISIBLE
                 holder.fileNameText.text = message.fileName
                     ?: message.filePath?.let { File(it).name }
@@ -252,6 +267,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.photoImage.visibility = View.GONE
                 holder.photoImage.setOnClickListener(null)
                 holder.fileRow.visibility = View.GONE
+                holder.locationRow.visibility = View.GONE
                 holder.videoContainer.visibility = View.VISIBLE
                 val path = message.videoPath
                 val thumbWidthPx = (220 * context.resources.displayMetrics.density).toInt()
@@ -267,6 +283,24 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.videoThumbnail.setOnClickListener(openOnClick)
                 holder.bubble.setOnClickListener(openOnClick)
             }
+            ChatMessage.Type.LOCATION -> {
+                holder.messageText.visibility = View.GONE
+                holder.voiceRow.visibility = View.GONE
+                holder.buttonPlay.setOnClickListener(null)
+                holder.photoImage.visibility = View.GONE
+                holder.photoImage.setOnClickListener(null)
+                holder.videoContainer.visibility = View.GONE
+                holder.videoThumbnail.setOnClickListener(null)
+                holder.fileRow.visibility = View.GONE
+                holder.locationRow.visibility = View.VISIBLE
+                holder.locationTitleText.text =
+                    context.getString(R.string.location_title)
+                holder.locationCoordsText.text = formatCoordinates(message)
+                // The title and coordinates are plain text views, so a
+                // tap anywhere on the bubble lands here; a long press
+                // reaches the bubble's reply listener the same way.
+                holder.bubble.setOnClickListener { openLocation(context, message) }
+            }
             ChatMessage.Type.TEXT -> {
                 holder.messageText.visibility = View.VISIBLE
                 holder.voiceRow.visibility = View.GONE
@@ -276,6 +310,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.videoContainer.visibility = View.GONE
                 holder.videoThumbnail.setOnClickListener(null)
                 holder.fileRow.visibility = View.GONE
+                holder.locationRow.visibility = View.GONE
                 holder.bubble.setOnClickListener(null)
             }
         }
@@ -555,6 +590,40 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             context.startActivity(intent)
         } catch (e: Exception) {
             Toast.makeText(context, R.string.no_app_for_file, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // ---------- Locations ----------
+
+    /** The coordinates as shown in a location bubble: "29.236055, 71.065222". */
+    private fun formatCoordinates(message: ChatMessage): String =
+        String.format(
+            Locale.US, "%.6f, %.6f",
+            message.latitude ?: 0.0, message.longitude ?: 0.0
+        )
+
+    /**
+     * Opens a tapped location in the phone's maps app (whichever the
+     * user picks in the chooser). A friendly Toast appears when no app
+     * on the phone can show a position.
+     */
+    private fun openLocation(context: Context, message: ChatMessage) {
+        val latitude = message.latitude
+        val longitude = message.longitude
+        if (latitude == null || longitude == null) return
+        val coordinates = String.format(Locale.US, "%.6f,%.6f", latitude, longitude)
+        val geoUri = Uri.parse(
+            "geo:$coordinates?q=$coordinates(Shared%20location)"
+        )
+        val intent = Intent(Intent.ACTION_VIEW, geoUri)
+        try {
+            context.startActivity(
+                Intent.createChooser(intent, context.getString(R.string.location_title))
+            )
+        } catch (e: ActivityNotFoundException) {
+            Toast.makeText(context, R.string.no_app_for_location, Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(context, R.string.no_app_for_location, Toast.LENGTH_SHORT).show()
         }
     }
 

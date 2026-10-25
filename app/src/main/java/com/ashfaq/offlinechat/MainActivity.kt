@@ -1,12 +1,17 @@
 package com.ashfaq.offlinechat
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.media.ExifInterface
 import android.media.MediaMetadataRetriever
 import android.media.MediaRecorder
@@ -44,6 +49,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private lateinit var buttonMic: ImageButton
     private lateinit var buttonPhoto: ImageButton
     private lateinit var buttonFile: ImageButton
+    private lateinit var buttonLocation: ImageButton
     private lateinit var quoteBar: View
     private lateinit var quoteBarSender: TextView
     private lateinit var quoteBarText: TextView
@@ -92,6 +98,29 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
     }
 
+    // Asking for the location permission only puts the permission
+    // right; the position itself is fetched when the user taps the
+    // location button again (the same "tap again after granting"
+    // shape as the rest of the app). A full refusal is explained.
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        if (results.values.none { it }) {
+            Toast.makeText(
+                this, R.string.location_permission_needed, Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    // Waiting-for-a-fix state: the manager and listener of the one
+    // single update that may be in flight, and the providers still
+    // left to try when it times out. All null/empty when idle.
+    private var pendingLocationManager: LocationManager? = null
+    private var pendingLocationListener: LocationListener? = null
+    private var pendingLocationProviders: List<String> = emptyList()
+    private val locationHandler = Handler(Looper.getMainLooper())
+    private val locationTimeout = Runnable { onLocationTimeout() }
+
     // The system media picker (photos and videos): no storage
     // permission is needed, and a cancelled pick simply gives us
     // nothing (not an error). The picked item's type decides which
@@ -135,6 +164,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonMic = findViewById(R.id.buttonMic)
         buttonPhoto = findViewById(R.id.buttonPhoto)
         buttonFile = findViewById(R.id.buttonFile)
+        buttonLocation = findViewById(R.id.buttonLocation)
         quoteBar = findViewById(R.id.quoteBar)
         quoteBarSender = findViewById(R.id.quoteBarSender)
         quoteBarText = findViewById(R.id.quoteBarText)
@@ -169,6 +199,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonMic.setOnClickListener { onMicClicked() }
         buttonPhoto.setOnClickListener { onPhotoClicked() }
         buttonFile.setOnClickListener { onFileClicked() }
+        buttonLocation.setOnClickListener { onLocationClicked() }
         buttonName.setOnClickListener { showNameDialog() }
         buttonClearChat.setOnClickListener { confirmClearChat() }
         buttonTheme.setOnClickListener { toggleDarkMode() }
@@ -227,6 +258,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonPhoto.setColorFilter(AppColors.iconTint(this))
         buttonFile.setColorFilter(AppColors.iconTint(this))
         buttonMic.setColorFilter(AppColors.iconTint(this))
+        buttonLocation.setColorFilter(AppColors.iconTint(this))
 
         // The Find / Disconnect / Send buttons take their colors from
         // the (light) app theme, which would leave the outlined
@@ -248,6 +280,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         closing = true
         requestDialog?.dismiss()
         discardRecording()
+        stopLocationWait()
         chatManager.disconnect()
         super.onDestroy()
     }
@@ -358,6 +391,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             R.string.quote_file_preview,
             message.fileName ?: message.filePath?.let { File(it).name } ?: ""
         )
+        ChatMessage.Type.LOCATION -> getString(R.string.quote_location_preview)
     }
 
     /** "0:07" style, like the voice rows in the chat show it. */
@@ -892,6 +926,195 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
     }
 
+    // ---------- Location messages ----------
+
+    /**
+     * The 📍 button: shares this phone's current position. Without the
+     * location permission there is nothing to share, so it is asked
+     * for first and the tap ends there (after granting, the user taps
+     * again). The position comes from the framework LocationManager —
+     * the app has no Google location library and gains none.
+     */
+    private fun onLocationClicked() {
+        if (!chatManager.isConnected()) {
+            Toast.makeText(this, R.string.not_connected_location, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (pendingLocationListener != null) {
+            // A fix is already on its way; extra taps change nothing.
+            return
+        }
+        val fineGranted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val coarseGranted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!fineGranted && !coarseGranted) {
+            locationPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
+            return
+        }
+        fetchAndSendLocation()
+    }
+
+    /**
+     * Finds the position and shares it. A last-known position that is
+     * still fresh (at most [LOCATION_FRESH_MS] old) is shared at once;
+     * otherwise one fresh fix is requested — GPS first, the network
+     * provider as fallback — with a timeout per provider. When no
+     * provider is on, or none answers in time, the normal error path
+     * explains what to do.
+     */
+    @SuppressLint("MissingPermission") // checked in onLocationClicked
+    private fun fetchAndSendLocation() {
+        val manager = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        if (manager == null) {
+            onError(getString(R.string.location_unavailable))
+            return
+        }
+        freshLastKnownLocation(manager)?.let { fresh ->
+            sendLocation(fresh)
+            return
+        }
+        val providers = enabledLocationProviders(manager)
+        if (providers.isEmpty()) {
+            onError(getString(R.string.location_unavailable))
+            return
+        }
+        setStatus(getString(R.string.location_finding), R.color.status_idle)
+        requestSingleFix(manager, providers)
+    }
+
+    /**
+     * The newest last-known position from GPS or the network provider,
+     * when it is at most [LOCATION_FRESH_MS] old; older (or none) is
+     * not worth sharing, so null then.
+     */
+    @SuppressLint("MissingPermission") // checked in onLocationClicked
+    private fun freshLastKnownLocation(manager: LocationManager): Location? {
+        val now = System.currentTimeMillis()
+        var best: Location? = null
+        for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+            val candidate = try {
+                manager.getLastKnownLocation(provider)
+            } catch (e: Exception) {
+                null // no such provider on this phone, or no permission
+            } ?: continue
+            val currentBest = best
+            if (currentBest == null || candidate.time > currentBest.time) {
+                best = candidate
+            }
+        }
+        val fresh = best ?: return null
+        return if (now - fresh.time <= LOCATION_FRESH_MS) fresh else null
+    }
+
+    /** The providers that are switched on, GPS before network. */
+    private fun enabledLocationProviders(manager: LocationManager): List<String> =
+        listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+            .filter { provider ->
+                try {
+                    manager.isProviderEnabled(provider)
+                } catch (e: Exception) {
+                    false // no such provider on this phone
+                }
+            }
+
+    /**
+     * Asks the first of [providers] for one fresh fix and waits at
+     * most [LOCATION_TIMEOUT_MS] for it. The answer is delivered on
+     * the main thread (the looper given to the request), where the
+     * chat lives.
+     */
+    @SuppressLint("MissingPermission") // checked in onLocationClicked
+    private fun requestSingleFix(manager: LocationManager, providers: List<String>) {
+        val listener = object : LocationListener {
+            override fun onLocationChanged(location: Location) {
+                stopLocationWait()
+                sendLocation(location)
+            }
+
+            override fun onProviderDisabled(provider: String) {
+                // The timeout that is already running ends this wait.
+            }
+
+            override fun onProviderEnabled(provider: String) = Unit
+
+            @Deprecated("Only called on old Android versions.")
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
+        }
+        pendingLocationManager = manager
+        pendingLocationListener = listener
+        pendingLocationProviders = providers.drop(1)
+        try {
+            manager.requestSingleUpdate(providers.first(), listener, Looper.getMainLooper())
+        } catch (e: Exception) {
+            // The request itself refused (provider just went away, ...):
+            // treat it like a timeout for this provider.
+            onLocationTimeout()
+            return
+        }
+        locationHandler.removeCallbacks(locationTimeout)
+        locationHandler.postDelayed(locationTimeout, LOCATION_TIMEOUT_MS)
+    }
+
+    /**
+     * One provider did not answer in time: try the next one that is
+     * left, or give up through the normal error path.
+     */
+    private fun onLocationTimeout() {
+        val manager = pendingLocationManager
+        val remaining = pendingLocationProviders
+        stopLocationWait()
+        if (manager != null && remaining.isNotEmpty()) {
+            requestSingleFix(manager, remaining)
+        } else {
+            onError(getString(R.string.location_unavailable))
+        }
+    }
+
+    /** Ends a wait for a fix, whatever stage it reached. */
+    private fun stopLocationWait() {
+        locationHandler.removeCallbacks(locationTimeout)
+        val manager = pendingLocationManager
+        val listener = pendingLocationListener
+        if (manager != null && listener != null) {
+            try {
+                manager.removeUpdates(listener)
+            } catch (ignored: Exception) {
+                // The listener was never registered, or is already gone.
+            }
+        }
+        pendingLocationManager = null
+        pendingLocationListener = null
+        pendingLocationProviders = emptyList()
+    }
+
+    /** Puts the position on its way and shows our own bubble at once. */
+    private fun sendLocation(location: Location) {
+        val localId = nextLocalId++
+        if (!chatManager.sendLocationMessage(location.latitude, location.longitude, localId)) {
+            Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
+            return
+        }
+        addMessage(
+            ChatMessage(
+                text = "",
+                isSent = true,
+                type = ChatMessage.Type.LOCATION,
+                latitude = location.latitude,
+                longitude = location.longitude,
+                localId = localId
+            )
+        )
+        setStatus(getString(R.string.location_sent), R.color.status_connected)
+    }
+
     // ---------- Permissions ----------
 
     private fun requiredPermissions(): Array<String> {
@@ -1147,6 +1370,24 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         )
     }
 
+    override fun onLocationMessageReceived(
+        latitude: Double,
+        longitude: Double,
+        senderName: String?
+    ) {
+        if (closing) return
+        addMessage(
+            ChatMessage(
+                text = "",
+                isSent = false,
+                type = ChatMessage.Type.LOCATION,
+                latitude = latitude,
+                longitude = longitude,
+                senderName = senderName
+            )
+        )
+    }
+
     override fun onError(message: String) {
         if (closing) return
         requestDialog?.dismiss()
@@ -1161,5 +1402,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         private const val PHOTO_JPEG_QUALITY = 80
         private const val MAX_FILE_SIZE_BYTES = 100L * 1024 * 1024 // 100 MB
         private const val QUOTE_PREVIEW_MAX_CHARS = 60
+        // A last-known position older than this is not shared; a fresh
+        // fix is asked for instead, and each provider gets this long
+        // to answer before the next one is tried.
+        private const val LOCATION_FRESH_MS = 2 * 60_000L // 2 minutes
+        private const val LOCATION_TIMEOUT_MS = 15_000L // 15 seconds
     }
 }

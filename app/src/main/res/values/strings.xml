@@ -51,7 +51,17 @@
 <string name="quote_photo_preview">📷 Photo</string>
 <string name="quote_video_preview">🎥 Video (%1$s)</string>
 <string name="quote_file_preview">📄 %1$s</string>
+<string name="quote_location_preview">📍 Location</string>
 <string name="cancel_reply">Cancel reply</string>
+
+<string name="share_location">Share your location</string>
+<string name="not_connected_location">Not connected. Location not sent.</string>
+<string name="location_permission_needed">Location permission is needed to share your location</string>
+<string name="location_unavailable">Location not available. Turn on location and try again.</string>
+<string name="location_finding">Finding your location...</string>
+<string name="location_sent">Location sent</string>
+<string name="location_title">📍 Location</string>
+<string name="no_app_for_location">No maps app found on this phone</string>
 
 <string name="your_name">Name</string>
 <string name="clear_chat">Clear</string>

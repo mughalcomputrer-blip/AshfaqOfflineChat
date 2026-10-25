@@ -202,6 +202,16 @@
             android:textColorHint="@color/text_secondary" />
 
         <ImageButton
+            android:id="@+id/buttonLocation"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"
+            android:background="@android:color/transparent"
+            android:contentDescription="@string/share_location"
+            android:src="@android:drawable/ic_menu_mylocation"
+            android:tint="@color/primary" />
+
+        <ImageButton
             android:id="@+id/buttonPhoto"
             android:layout_width="48dp"
             android:layout_height="48dp"

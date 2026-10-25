@@ -28,13 +28,12 @@
     <!-- Microphone, for recording voice messages (Phase 4) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
-    <!-- Location, required by Android for scanning on Android 12L and older -->
-    <uses-permission
-        android:name="android.permission.ACCESS_COARSE_LOCATION"
-        android:maxSdkVersion="28" />
-    <uses-permission
-        android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="32" />
+    <!-- Location: required by Android for scanning on Android 12L and
+         older, and for sharing this phone's position in a chat
+         (Update 7), which must work on every Android version — so
+         unlike before, these two are no longer capped by maxSdkVersion. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
     <application
         android:allowBackup="false"

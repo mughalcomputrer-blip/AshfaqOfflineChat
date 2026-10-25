@@ -20,6 +20,10 @@ data class ChatMessage(
     val filePath: String? = null,
     val fileName: String? = null,
     val fileSizeBytes: Long = 0,
+    // Only used for location messages: the shared position, in
+    // degrees. Both are set together, or both stay null.
+    val latitude: Double? = null,
+    val longitude: Double? = null,
     // Who originally sent this message, in a group chat. Only set on
     // received messages that carried a name; our own messages and
     // messages from older app versions have none.
@@ -38,5 +42,5 @@ data class ChatMessage(
     val localId: Long = 0,
     val delivered: Boolean = false
 ) {
-    enum class Type { TEXT, VOICE, PHOTO, FILE, VIDEO }
+    enum class Type { TEXT, VOICE, PHOTO, FILE, VIDEO, LOCATION }
 }

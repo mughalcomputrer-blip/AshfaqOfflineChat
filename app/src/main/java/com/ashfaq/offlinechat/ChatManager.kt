@@ -20,6 +20,7 @@ import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
 import java.io.File
+import java.util.Locale
 import java.util.UUID
 
 /**
@@ -44,6 +45,13 @@ import java.util.UUID
  * a voice, photo, video or file reply is preceded by a tiny "#RPLY#"
  * text holding the quote, paired with the file that follows it in the
  * same per-endpoint way as the file info texts.
+ *
+ * Location sharing: a shared position rides in an ordinary text
+ * payload whose text is "#LOC#" + latitude + "," + longitude. It
+ * therefore travels exactly like a text message — same id, same
+ * dedupe, same "delivered" ticks, and the hub's word-for-word relay
+ * carries it to the whole group — and is only recognised (and taken
+ * out of the text stream) here, after the payload is unpacked.
  */
 class ChatManager(
     context: Context,
@@ -79,6 +87,17 @@ class ChatManager(
             quotedSender: String?,
             quotedText: String?
         )
+
+        /**
+         * A shared position arrived. [senderName] is who sent it
+         * (null if unknown), like for a text message.
+         */
+        fun onLocationMessageReceived(
+            latitude: Double,
+            longitude: Double,
+            senderName: String?
+        ) {}
+
         fun onError(message: String)
 
         /** The connection dropped and an automatic retry is about to happen. */
@@ -387,6 +406,25 @@ class ChatManager(
         client.sendPayload(targets, payload)
             .addOnFailureListener { e -> listener.onError(describe(e)) }
         return true
+    }
+
+    /**
+     * Shares this phone's position. The position is packed into a
+     * control text ("#LOC#" + latitude + "," + longitude, six decimal
+     * places) and sent through the ordinary text path ([sendMessage]),
+     * so it gets a message id, the sender's name, the "delivered"
+     * ticks and the hub's word-for-word relay exactly like a typed
+     * message; the receiving side recognises the control text in
+     * [parseLocationText] and never shows it as a chat text.
+     */
+    fun sendLocationMessage(
+        latitude: Double,
+        longitude: Double,
+        localId: Long = 0
+    ): Boolean {
+        val text = LOCATION_PREFIX +
+            String.format(Locale.US, "%.6f,%.6f", latitude, longitude)
+        return sendMessage(text, localId)
     }
 
     /**
@@ -863,10 +901,24 @@ class ChatManager(
                     if (message.id != null && !rememberMessageId(message.id)) {
                         return // We already showed this message once.
                     }
-                    listener.onMessageReceived(
-                        message.text, message.senderName,
-                        message.quotedSender, message.quotedText
-                    )
+                    // A location arrives as an ordinary text payload
+                    // whose text is the "#LOC#" control text; it is
+                    // recognised here and reported as a location, never
+                    // shown as a chat text. One that starts with the
+                    // prefix but does not parse is a control text gone
+                    // wrong and is dropped silently — but relayed below
+                    // like everything else, so the group stays in step.
+                    val location = parseLocationText(message.text)
+                    when {
+                        location != null -> listener.onLocationMessageReceived(
+                            location.first, location.second, message.senderName
+                        )
+                        message.text.startsWith(LOCATION_PREFIX) -> Unit
+                        else -> listener.onMessageReceived(
+                            message.text, message.senderName,
+                            message.quotedSender, message.quotedText
+                        )
+                    }
                     if (role == Role.HUB) {
                         // The host passes every member's message on to the
                         // rest of the group, word for word (same id, same
@@ -1364,6 +1416,30 @@ class ChatManager(
         return UnpackedMessage(null, null, raw)
     }
 
+    /**
+     * Reads a location control text: "#LOC#" + latitude + "," +
+     * longitude. Returns the position only when the text is exactly
+     * that — two plain numbers, a latitude between -90 and 90 and a
+     * longitude between -180 and 180 — and null in every other case,
+     * so a typed chat text can never be mistaken for a position by
+     * accident, and a damaged control text is dropped, never shown.
+     */
+    private fun parseLocationText(text: String): Pair<Double, Double>? {
+        if (!text.startsWith(LOCATION_PREFIX)) return null
+        val parts = text.substring(LOCATION_PREFIX.length).split(',')
+        if (parts.size != 2) return null
+        val latitude = parts[0].trim().toDoubleOrNull() ?: return null
+        val longitude = parts[1].trim().toDoubleOrNull() ?: return null
+        if (latitude.isNaN() || latitude.isInfinite() ||
+            longitude.isNaN() || longitude.isInfinite()
+        ) {
+            return null
+        }
+        if (latitude < -90.0 || latitude > 90.0) return null
+        if (longitude < -180.0 || longitude > 180.0) return null
+        return latitude to longitude
+    }
+
     /** Remembers a message id. Returns false when the id was already seen. */
     private fun rememberMessageId(id: String): Boolean {
         if (!seenMessageIds.add(id)) return false
@@ -1401,6 +1477,9 @@ class ChatManager(
         private const val FILE_DIR_NAME = "files"
         private const val VIDEO_PREFIX = "#VIDEO#"
         private const val VIDEO_DIR_NAME = "videos"
+        // A shared position, packed inside an ordinary text payload:
+        // "#LOC#" + latitude + "," + longitude (see sendLocationMessage).
+        private const val LOCATION_PREFIX = "#LOC#"
         private const val MAX_FILE_NAME_LENGTH = 128
 
         /** How many members ("spokes") the host can have: a group is at
