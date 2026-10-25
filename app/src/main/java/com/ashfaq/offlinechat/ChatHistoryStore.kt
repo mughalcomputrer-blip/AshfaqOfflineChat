@@ -89,6 +89,10 @@ object ChatHistoryStore {
             message.fileName?.let { item.put("fname", it) }
             item.put("fsize", message.fileSizeBytes)
             message.senderName?.let { item.put("from", it) }
+            // The local id and the delivered ticks of our own messages,
+            // so they survive a restart like the messages themselves.
+            item.put("lid", message.localId)
+            item.put("delivered", message.delivered)
             array.put(item)
         }
         return array.toString()
@@ -114,6 +118,8 @@ object ChatHistoryStore {
         } else {
             item.optString("from").takeIf { it.isNotEmpty() }
         }
+        // Older history files have no "lid"/"delivered" keys either;
+        // those own messages then honestly show the single "sent" tick.
         // A voice, photo or file entry is only useful while its file is
         // still there; sent files lived in the cache and may be gone by now.
         when (type) {
@@ -136,7 +142,9 @@ object ChatHistoryStore {
             filePath = filePath,
             fileName = fileName,
             fileSizeBytes = item.optLong("fsize", 0L),
-            senderName = senderName
+            senderName = senderName,
+            localId = item.optLong("lid", 0L),
+            delivered = item.optBoolean("delivered", false)
         )
     }
 }

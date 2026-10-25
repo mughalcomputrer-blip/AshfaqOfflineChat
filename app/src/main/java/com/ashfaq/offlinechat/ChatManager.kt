@@ -69,6 +69,14 @@ class ChatManager(
         /** The connection dropped and an automatic retry is about to happen. */
         fun onReconnecting(attempt: Int, maxAttempts: Int) {}
 
+        /**
+         * One of our own sent messages finished transferring to the
+         * next phone (its payload transfer reported SUCCESS). [localId]
+         * is the id the message was sent with; 0 is never reported.
+         * This is local bookkeeping only — nothing extra goes on the wire.
+         */
+        fun onMessageDelivered(localId: Long) {}
+
         /** A voice message arrived; [filePath] points to our own copy of it. */
         fun onVoiceMessageReceived(
             filePath: String,
@@ -173,6 +181,16 @@ class ChatManager(
     // Ids of messages we already showed, so a repeated delivery is dropped.
     private val seenMessageIds = LinkedHashSet<String>()
 
+    // Payloads of our own messages that Nearby has not finished sending
+    // yet: Nearby payload id -> the local id of the message, so a
+    // finished transfer can put the "delivered" ticks on the right
+    // chat row. Only the content payload is tracked (for voice, photo
+    // and file messages that is the file payload, not the tiny info
+    // text before it). Local id 0 means "not tracked" and is never
+    // stored here — the host's relays of other people's messages are
+    // therefore never reported as deliveries.
+    private val outgoingPayloads = mutableMapOf<Long, Long>()
+
     // File payloads that arrived and are still being transferred.
     private val incomingFilePayloads = mutableMapOf<Long, Payload>()
 
@@ -260,7 +278,12 @@ class ChatManager(
             connectedEndpoints.keys.toList()
         }
 
-    fun sendMessage(text: String): Boolean {
+    /**
+     * Sends a text message. [localId] is the sender app's own id for
+     * this message (0 = do not track); when the transfer to the next
+     * phone finishes, the listener hears about it via onMessageDelivered.
+     */
+    fun sendMessage(text: String, localId: Long = 0): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
         // Every message carries its own random id, so the other phones can
@@ -275,6 +298,7 @@ class ChatManager(
             MESSAGE_ID_PREFIX + id + FROM_INFIX + name + "#" + text
         }
         val payload = Payload.fromBytes(wireText.toByteArray(Charsets.UTF_8))
+        if (localId != 0L) outgoingPayloads[payload.id] = localId
         client.sendPayload(targets, payload)
             .addOnFailureListener { e -> listener.onError(describe(e)) }
         return true
@@ -285,7 +309,7 @@ class ChatManager(
      * info, so we first send a tiny text info ("#VOICE#" + seconds + "#" +
      * sender name + "#" + file name) and then the audio file itself.
      */
-    fun sendVoiceMessage(file: File, durationSeconds: Int): Boolean {
+    fun sendVoiceMessage(file: File, durationSeconds: Int, localId: Long = 0): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
         val name = wireSenderName()
@@ -294,7 +318,9 @@ class ChatManager(
         } else {
             VOICE_PREFIX + durationSeconds + "#" + name + "#" + file.name
         }
-        return sendInfoAndFile(targets, info, file, "The voice message could not be sent.")
+        return sendInfoAndFile(
+            targets, info, file, "The voice message could not be sent.", localId
+        )
     }
 
     /**
@@ -302,7 +328,7 @@ class ChatManager(
      * extra info, so we first send a tiny text info ("#PHOTO#" + sender
      * name + "#" + file name) and then the image file itself.
      */
-    fun sendPhotoMessage(file: File): Boolean {
+    fun sendPhotoMessage(file: File, localId: Long = 0): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
         val name = wireSenderName()
@@ -311,7 +337,9 @@ class ChatManager(
         } else {
             PHOTO_PREFIX + name + "#" + file.name
         }
-        return sendInfoAndFile(targets, info, file, "The photo could not be sent.")
+        return sendInfoAndFile(
+            targets, info, file, "The photo could not be sent.", localId
+        )
     }
 
     /**
@@ -321,7 +349,7 @@ class ChatManager(
      * name) and then the file itself. The file must already carry its
      * final name, because that name is what the other phones save and show.
      */
-    fun sendFileMessage(file: File): Boolean {
+    fun sendFileMessage(file: File, localId: Long = 0): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
         val name = wireSenderName()
@@ -330,7 +358,9 @@ class ChatManager(
         } else {
             FILE_PREFIX + name + "#" + file.name
         }
-        return sendInfoAndFile(targets, info, file, "The file could not be sent.")
+        return sendInfoAndFile(
+            targets, info, file, "The file could not be sent.", localId
+        )
     }
 
     /**
@@ -338,13 +368,17 @@ class ChatManager(
      * our own sends ([errorMessage] is shown when the file itself cannot
      * even be started) and for the host passing a received file on to the
      * rest of the group (then there is no useful error to show, so
-     * [errorMessage] is null and a failure stays silent).
+     * [errorMessage] is null and a failure stays silent, and [localId]
+     * stays 0 because the file is not the host's own message).
+     * When [localId] is not 0, the FILE payload (not the info text) is
+     * what counts for the "delivered" ticks of our own message.
      */
     private fun sendInfoAndFile(
         targets: List<String>,
         info: String,
         file: File,
-        errorMessage: String?
+        errorMessage: String?,
+        localId: Long = 0
     ): Boolean {
         if (targets.isEmpty()) return false
         val filePayload = try {
@@ -353,6 +387,7 @@ class ChatManager(
             if (errorMessage != null) listener.onError(errorMessage)
             return false
         }
+        if (localId != 0L) outgoingPayloads[filePayload.id] = localId
         client.sendPayload(targets, Payload.fromBytes(info.toByteArray(Charsets.UTF_8)))
             .addOnFailureListener { e -> listener.onError(describe(e)) }
         client.sendPayload(targets, filePayload)
@@ -372,6 +407,9 @@ class ChatManager(
         incomingFilePayloads.clear()
         filePayloadEndpoints.clear()
         pendingFiles.clear()
+        // Transfers that never finished will never report now; their
+        // messages simply keep the single "sent" tick.
+        outgoingPayloads.clear()
         client.stopAdvertising()
         client.stopDiscovery()
         client.stopAllEndpoints()
@@ -682,12 +720,24 @@ class ChatManager(
             if (update.status == PayloadTransferUpdate.Status.FAILURE) {
                 val wasIncoming = incomingFilePayloads.remove(update.payloadId) != null
                 filePayloadEndpoints.remove(update.payloadId)
+                // A failed send of ours is forgotten here; its message
+                // simply never earns the second tick (the error below
+                // is the same feedback as before).
+                outgoingPayloads.remove(update.payloadId)
                 if (wasIncoming) {
                     // The file is gone, so its info message is stale too.
                     pendingFiles.remove(endpointId)
                 }
                 listener.onError("A message could not be transferred.")
             } else if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
+                // One of our own messages finished transferring to the
+                // next phone. In a group send the payload goes to
+                // several phones with one payload id, so the FIRST
+                // success is the one that counts as delivered; later
+                // ones find nothing left in the map.
+                outgoingPayloads.remove(update.payloadId)?.let { localId ->
+                    listener.onMessageDelivered(localId)
+                }
                 val filePayload = incomingFilePayloads.remove(update.payloadId)
                 filePayloadEndpoints.remove(update.payloadId)
                 if (filePayload != null) {

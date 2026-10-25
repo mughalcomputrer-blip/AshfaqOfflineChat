@@ -11,6 +11,9 @@
 
     <color name="bubble_sent">#12B5A5</color>
     <color name="bubble_sent_text">#FFFFFF</color>
+    <!-- The delivered ticks on our own bubbles: the sent text color,
+         softened with alpha so the ticks stay subtle. -->
+    <color name="bubble_sent_ticks">#B3FFFFFF</color>
     <color name="bubble_received">#FFFFFF</color>
     <color name="bubble_received_text">#1C2733</color>
     <color name="bubble_received_stroke">#DFE6EE</color>

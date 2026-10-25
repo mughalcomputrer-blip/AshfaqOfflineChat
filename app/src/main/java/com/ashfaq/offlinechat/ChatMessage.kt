@@ -20,7 +20,14 @@ data class ChatMessage(
     // Who originally sent this message, in a group chat. Only set on
     // received messages that carried a name; our own messages and
     // messages from older app versions have none.
-    val senderName: String? = null
+    val senderName: String? = null,
+    // Local-only bookkeeping for our own sent messages (never put on
+    // the wire): an id this app hands out when the message is sent, so
+    // a finished transfer can be matched back to this chat row, and
+    // whether that transfer has finished (the "delivered" ticks).
+    // Received messages and history from older versions keep 0/false.
+    val localId: Long = 0,
+    val delivered: Boolean = false
 ) {
     enum class Type { TEXT, VOICE, PHOTO, FILE }
 }

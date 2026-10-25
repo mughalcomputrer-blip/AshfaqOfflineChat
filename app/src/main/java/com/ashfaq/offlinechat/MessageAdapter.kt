@@ -49,6 +49,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val fileNameText: TextView = view.findViewById(R.id.fileNameText)
         val fileSizeText: TextView = view.findViewById(R.id.fileSizeText)
         val timeText: TextView = view.findViewById(R.id.timeText)
+        val ticksText: TextView = view.findViewById(R.id.ticksText)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): MessageViewHolder {
@@ -63,6 +64,17 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
 
         holder.messageText.text = message.text
         holder.timeText.text = timeFormat.format(Date(message.timestamp))
+
+        // WhatsApp-style ticks next to the time, on our own messages
+        // only: one tick = handed to Nearby for sending, two ticks =
+        // the transfer to the next phone finished.
+        if (message.isSent) {
+            holder.ticksText.visibility = View.VISIBLE
+            holder.ticksText.text = if (message.delivered) "✓✓" else "✓"
+        } else {
+            holder.ticksText.visibility = View.GONE
+            holder.ticksText.text = null
+        }
 
         // In a group, a received message shows who originally sent it.
         // Our own messages (and nameless ones from older versions) don't.
@@ -198,6 +210,22 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     fun addMessage(message: ChatMessage) {
         messages.add(message)
         notifyItemInserted(messages.size - 1)
+    }
+
+    /**
+     * Puts the second tick on one of our own sent messages: its
+     * transfer to the next phone finished. Returns true when a shown
+     * message really changed (so the caller can save the history).
+     */
+    fun markDelivered(localId: Long): Boolean {
+        if (localId == 0L) return false
+        val index = messages.indexOfFirst {
+            it.localId == localId && it.isSent && !it.delivered
+        }
+        if (index < 0) return false
+        messages[index] = messages[index].copy(delivered = true)
+        notifyItemChanged(index)
+        return true
     }
 
     /** A copy of the messages currently shown, oldest first. */

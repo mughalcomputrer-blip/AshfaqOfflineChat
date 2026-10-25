@@ -44,6 +44,12 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private var requestDialog: AlertDialog? = null
     private var closing = false
 
+    // Ids for our own sent messages, handed out one per message, so a
+    // finished transfer can be matched back to its chat row (the
+    // "delivered" ticks). Continued after the loaded history in
+    // onCreate, so ids never repeat within the saved chat.
+    private var nextLocalId = 1L
+
     // Voice recording state.
     private var recorder: MediaRecorder? = null
     private var recordingFile: File? = null
@@ -120,6 +126,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             adapter.setMessages(history)
             recyclerMessages.scrollToPosition(history.size - 1)
         }
+        // New messages we send get fresh local ids, continuing after
+        // the highest id the loaded history already uses.
+        nextLocalId = (history.maxOfOrNull { it.localId } ?: 0L) + 1L
 
         chatManager = ChatManager(this, this)
 
@@ -161,11 +170,12 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private fun sendCurrentMessage() {
         val text = editMessage.text.toString().trim()
         if (text.isEmpty()) return
-        if (!chatManager.sendMessage(text)) {
+        val localId = nextLocalId++
+        if (!chatManager.sendMessage(text, localId)) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
             return
         }
-        addMessage(ChatMessage(text = text, isSent = true))
+        addMessage(ChatMessage(text = text, isSent = true, localId = localId))
         editMessage.text.clear()
     }
 
@@ -259,7 +269,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             Toast.makeText(this, R.string.voice_recording_failed, Toast.LENGTH_SHORT).show()
             return
         }
-        if (!chatManager.sendVoiceMessage(file, durationSeconds)) {
+        val localId = nextLocalId++
+        if (!chatManager.sendVoiceMessage(file, durationSeconds, localId)) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
             return
         }
@@ -269,7 +280,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 isSent = true,
                 type = ChatMessage.Type.VOICE,
                 audioPath = file.absolutePath,
-                durationSeconds = durationSeconds
+                durationSeconds = durationSeconds,
+                localId = localId
             )
         )
         setStatus(getString(R.string.voice_sent), R.color.status_connected)
@@ -324,7 +336,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             Toast.makeText(this, R.string.photo_failed, Toast.LENGTH_SHORT).show()
             return
         }
-        if (!chatManager.sendPhotoMessage(file)) {
+        val localId = nextLocalId++
+        if (!chatManager.sendPhotoMessage(file, localId)) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
             return
         }
@@ -333,7 +346,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 text = "",
                 isSent = true,
                 type = ChatMessage.Type.PHOTO,
-                imagePath = file.absolutePath
+                imagePath = file.absolutePath,
+                localId = localId
             )
         )
     }
@@ -482,7 +496,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 return
             }
         }
-        if (!chatManager.sendFileMessage(file)) {
+        val localId = nextLocalId++
+        if (!chatManager.sendFileMessage(file, localId)) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
             return
         }
@@ -493,7 +508,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 type = ChatMessage.Type.FILE,
                 filePath = file.absolutePath,
                 fileName = file.name,
-                fileSizeBytes = file.length()
+                fileSizeBytes = file.length(),
+                localId = localId
             )
         )
     }
@@ -719,6 +735,15 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     override fun onMessageReceived(text: String, senderName: String?) {
         if (closing) return
         addMessage(ChatMessage(text = text, isSent = false, senderName = senderName))
+    }
+
+    override fun onMessageDelivered(localId: Long) {
+        if (closing) return
+        // Put the second tick on the message, and save the history so
+        // the ticks are still right after the app is reopened.
+        if (adapter.markDelivered(localId)) {
+            ChatHistoryStore.save(this, adapter.snapshot())
+        }
     }
 
     override fun onVoiceMessageReceived(
