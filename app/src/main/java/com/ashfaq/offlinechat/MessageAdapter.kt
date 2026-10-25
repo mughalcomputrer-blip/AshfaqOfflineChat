@@ -22,7 +22,7 @@ import java.util.Locale
 class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() {
 
     private val messages = mutableListOf<ChatMessage>()
-    private val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+    private val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
 
     // Voice playback state: at most one voice message plays at a time.
     private var mediaPlayer: MediaPlayer? = null
@@ -139,6 +139,23 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     fun addMessage(message: ChatMessage) {
         messages.add(message)
         notifyItemInserted(messages.size - 1)
+    }
+
+    /** A copy of the messages currently shown, oldest first. */
+    fun snapshot(): List<ChatMessage> = messages.toList()
+
+    /** Replaces everything shown with [history] (used at startup). */
+    fun setMessages(history: List<ChatMessage>) {
+        messages.clear()
+        messages.addAll(history)
+        notifyDataSetChanged()
+    }
+
+    /** Removes all messages from the screen (used by Clear chat). */
+    fun clearMessages() {
+        releasePlayer()
+        messages.clear()
+        notifyDataSetChanged()
     }
 
     // ---------- Voice playback ----------

@@ -16,6 +16,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.widget.EditText
 import android.widget.ImageButton
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
@@ -93,10 +94,19 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         val buttonFind: MaterialButton = findViewById(R.id.buttonFind)
         val buttonDisconnect: MaterialButton = findViewById(R.id.buttonDisconnect)
         val buttonSend: MaterialButton = findViewById(R.id.buttonSend)
+        val buttonName: TextView = findViewById(R.id.buttonName)
+        val buttonClearChat: TextView = findViewById(R.id.buttonClearChat)
 
         adapter = MessageAdapter()
         recyclerMessages.layoutManager = LinearLayoutManager(this)
         recyclerMessages.adapter = adapter
+
+        // Show the chat that was saved on this phone, if any.
+        val history = ChatHistoryStore.load(this)
+        if (history.isNotEmpty()) {
+            adapter.setMessages(history)
+            recyclerMessages.scrollToPosition(history.size - 1)
+        }
 
         chatManager = ChatManager(this, this)
 
@@ -105,6 +115,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonSend.setOnClickListener { sendCurrentMessage() }
         buttonMic.setOnClickListener { onMicClicked() }
         buttonPhoto.setOnClickListener { onPhotoClicked() }
+        buttonName.setOnClickListener { showNameDialog() }
+        buttonClearChat.setOnClickListener { confirmClearChat() }
     }
 
     override fun onDestroy() {
@@ -444,6 +456,55 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private fun addMessage(message: ChatMessage) {
         adapter.addMessage(message)
         recyclerMessages.scrollToPosition(adapter.itemCount - 1)
+        // Keep the on-phone history in step, so the chat survives a restart.
+        ChatHistoryStore.save(this, adapter.snapshot())
+    }
+
+    // ---------- Display name & chat history ----------
+
+    /** Lets the user change the name other phones see for this phone. */
+    private fun showNameDialog() {
+        val input = EditText(this).apply {
+            setText(chatManager.displayBaseName())
+            setSelection(text.length)
+            setSingleLine(true)
+            hint = getString(R.string.name_dialog_hint)
+        }
+        // Give the text field some room inside the dialog.
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val side = (20 * resources.displayMetrics.density).toInt()
+            setPadding(side, 0, side, 0)
+            addView(input)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.name_dialog_title)
+            .setMessage(R.string.name_dialog_message)
+            .setView(container)
+            .setPositiveButton(R.string.save) { _, _ ->
+                chatManager.updateDisplayName(input.text.toString())
+                Toast.makeText(
+                    this,
+                    getString(R.string.name_saved, chatManager.displayBaseName()),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /** Asks first, then wipes the saved history and the on-screen chat. */
+    private fun confirmClearChat() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.clear_chat_title)
+            .setMessage(R.string.clear_chat_message)
+            .setPositiveButton(R.string.clear_chat_confirm) { _, _ ->
+                adapter.clearMessages()
+                ChatHistoryStore.clear(this)
+                Toast.makeText(this, R.string.chat_cleared, Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     // ---------- ChatManager.Listener ----------

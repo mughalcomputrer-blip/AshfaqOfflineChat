@@ -56,8 +56,38 @@ class ChatManager(
     private val strategy = Strategy.P2P_POINT_TO_POINT
     private val handler = Handler(Looper.getMainLooper())
 
-    // Random suffix so two phones of the same model still have different names.
-    private val localName: String = "${Build.MODEL}-${(1000..9999).random()}"
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    // The name other phones see for us: the user's own display name when
+    // they set one, otherwise the phone model. A random suffix is added
+    // so two phones with the same name still have different names.
+    private var localName: String = buildLocalName()
+
+    private fun buildLocalName(): String =
+        "${displayBaseName()}-${(1000..9999).random()}"
+
+    /** The name the user picked, or the phone model when none was picked. */
+    fun displayBaseName(): String =
+        prefs.getString(KEY_DISPLAY_NAME, null)?.takeIf { it.isNotBlank() } ?: Build.MODEL
+
+    /**
+     * Saves a new display name (blank means "back to the phone model")
+     * and rebuilds the endpoint name from it. The new name is used from
+     * the next search on; a chat that is already connected keeps the
+     * name it started with. The name stays a plain endpoint-name string,
+     * so the "smaller name sends the request" logic is untouched.
+     */
+    fun updateDisplayName(newName: String) {
+        val trimmed = newName.trim()
+        val editor = prefs.edit()
+        if (trimmed.isEmpty()) {
+            editor.remove(KEY_DISPLAY_NAME)
+        } else {
+            editor.putString(KEY_DISPLAY_NAME, trimmed)
+        }
+        editor.apply()
+        localName = buildLocalName()
+    }
 
     private var pendingEndpointId: String? = null
     private var pendingName: String = ""
@@ -510,5 +540,7 @@ class ChatManager(
         private const val VOICE_DIR_NAME = "voice"
         private const val PHOTO_PREFIX = "#PHOTO#"
         private const val PHOTO_DIR_NAME = "photos"
+        private const val PREFS_NAME = "offline_chat_prefs"
+        private const val KEY_DISPLAY_NAME = "display_name"
     }
 }

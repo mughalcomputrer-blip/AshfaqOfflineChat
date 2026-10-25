@@ -34,4 +34,16 @@
 <string name="error_generic">Error: %1$s</string>
 <string name="error_hint">Make sure Bluetooth and Location are turned on, and that the other phone is also searching.</string>
 
+<string name="your_name">Name</string>
+<string name="clear_chat">Clear</string>
+<string name="name_dialog_title">Your display name</string>
+<string name="name_dialog_message">This is the name the other phone sees when you connect. Leave it empty to use your phone model instead.</string>
+<string name="name_dialog_hint">Your name</string>
+<string name="save">Save</string>
+<string name="name_saved">Your name is now %1$s</string>
+<string name="clear_chat_title">Clear chat history?</string>
+<string name="clear_chat_message">All messages in this chat will be removed from this phone.</string>
+<string name="clear_chat_confirm">Clear</string>
+<string name="chat_cleared">Chat cleared</string>
+
 </resources>
