@@ -3,7 +3,12 @@ package com.ashfaq.offlinechat
 import android.Manifest
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.media.MediaRecorder
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -13,6 +18,7 @@ import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -30,6 +36,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private lateinit var recyclerMessages: RecyclerView
     private lateinit var editMessage: EditText
     private lateinit var buttonMic: ImageButton
+    private lateinit var buttonPhoto: ImageButton
 
     private var requestDialog: AlertDialog? = null
     private var closing = false
@@ -62,6 +69,16 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
     }
 
+    // The system photo picker: no storage permission is needed, and a
+    // cancelled pick simply gives us nothing (not an error).
+    private val photoPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            prepareAndSendPhoto(uri)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Version 1 stays in portrait so a rotation cannot drop the connection.
@@ -72,6 +89,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         recyclerMessages = findViewById(R.id.recyclerMessages)
         editMessage = findViewById(R.id.editMessage)
         buttonMic = findViewById(R.id.buttonMic)
+        buttonPhoto = findViewById(R.id.buttonPhoto)
         val buttonFind: MaterialButton = findViewById(R.id.buttonFind)
         val buttonDisconnect: MaterialButton = findViewById(R.id.buttonDisconnect)
         val buttonSend: MaterialButton = findViewById(R.id.buttonSend)
@@ -86,6 +104,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonDisconnect.setOnClickListener { chatManager.disconnect() }
         buttonSend.setOnClickListener { sendCurrentMessage() }
         buttonMic.setOnClickListener { onMicClicked() }
+        buttonPhoto.setOnClickListener { onPhotoClicked() }
     }
 
     override fun onDestroy() {
@@ -250,6 +269,153 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         isRecording = false
     }
 
+    // ---------- Photo messages ----------
+
+    private fun onPhotoClicked() {
+        if (!chatManager.isConnected()) {
+            Toast.makeText(this, R.string.not_connected_photo, Toast.LENGTH_SHORT).show()
+            return
+        }
+        photoPickerLauncher.launch(
+            PickVisualMediaRequest.Builder()
+                .setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                .build()
+        )
+    }
+
+    /**
+     * Shrinks the picked photo (longest side at most [MAX_PHOTO_DIMENSION]
+     * pixels), saves it as a JPEG in the cache folder and sends it. Working
+     * on a small copy keeps the offline transfer fast.
+     */
+    private fun prepareAndSendPhoto(uri: Uri) {
+        val file = try {
+            createPreparedPhotoFile(uri)
+        } catch (e: Exception) {
+            null
+        }
+        if (file == null) {
+            Toast.makeText(this, R.string.photo_failed, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!chatManager.sendPhotoMessage(file)) {
+            Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
+            return
+        }
+        addMessage(
+            ChatMessage(
+                text = "",
+                isSent = true,
+                type = ChatMessage.Type.PHOTO,
+                imagePath = file.absolutePath
+            )
+        )
+    }
+
+    private fun createPreparedPhotoFile(uri: Uri): File? {
+        // Read only the size first, without loading the whole picture.
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, bounds)
+        } ?: return null
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        // Decode a sampled-down copy (about twice the final size at most),
+        // then scale exactly; this keeps memory use modest.
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = calculateInSampleSize(
+                bounds.outWidth, bounds.outHeight,
+                MAX_PHOTO_DIMENSION * 2, MAX_PHOTO_DIMENSION * 2
+            )
+        }
+        var bitmap = contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, decodeOptions)
+        } ?: return null
+
+        // Turn the picture the right way up, using the rotation stored in
+        // the photo itself (framework EXIF reader, Android 7 and newer;
+        // older phones simply keep the picture as it comes).
+        val rotationDegrees = readExifRotationDegrees(uri)
+        if (rotationDegrees != 0) {
+            val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+            val rotated = Bitmap.createBitmap(
+                bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
+            )
+            if (rotated !== bitmap) {
+                bitmap.recycle()
+                bitmap = rotated
+            }
+        }
+
+        val largestSide = maxOf(bitmap.width, bitmap.height)
+        if (largestSide > MAX_PHOTO_DIMENSION) {
+            val scale = MAX_PHOTO_DIMENSION.toFloat() / largestSide
+            val scaled = Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * scale).toInt().coerceAtLeast(1),
+                (bitmap.height * scale).toInt().coerceAtLeast(1),
+                true
+            )
+            if (scaled !== bitmap) {
+                bitmap.recycle()
+                bitmap = scaled
+            }
+        }
+
+        val file = File(cacheDir, "photo_${System.currentTimeMillis()}.jpg")
+        val saved = file.outputStream().use { output ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, PHOTO_JPEG_QUALITY, output)
+        }
+        bitmap.recycle()
+        if (!saved || !file.exists() || file.length() == 0L) {
+            file.delete()
+            return null
+        }
+        return file
+    }
+
+    /** Rotation stored in the photo (0, 90, 180 or 270). 0 when unknown. */
+    private fun readExifRotationDegrees(uri: Uri): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return 0
+        return try {
+            contentResolver.openInputStream(uri)?.use { input ->
+                when (
+                    ExifInterface(input).getAttributeInt(
+                        ExifInterface.TAG_ORIENTATION,
+                        ExifInterface.ORIENTATION_NORMAL
+                    )
+                ) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                    else -> 0
+                }
+            } ?: 0
+        } catch (e: Exception) {
+            0
+        }
+    }
+
+    private fun calculateInSampleSize(
+        width: Int,
+        height: Int,
+        reqWidth: Int,
+        reqHeight: Int
+    ): Int {
+        var inSampleSize = 1
+        if (height > reqHeight || width > reqWidth) {
+            val halfHeight = height / 2
+            val halfWidth = width / 2
+            while (
+                halfHeight / inSampleSize >= reqHeight &&
+                halfWidth / inSampleSize >= reqWidth
+            ) {
+                inSampleSize *= 2
+            }
+        }
+        return inSampleSize
+    }
+
     // ---------- Permissions ----------
 
     private fun requiredPermissions(): Array<String> {
@@ -350,6 +516,18 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         )
     }
 
+    override fun onPhotoMessageReceived(filePath: String) {
+        if (closing) return
+        addMessage(
+            ChatMessage(
+                text = "",
+                isSent = false,
+                type = ChatMessage.Type.PHOTO,
+                imagePath = filePath
+            )
+        )
+    }
+
     override fun onError(message: String) {
         if (closing) return
         requestDialog?.dismiss()
@@ -360,5 +538,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     companion object {
         private const val MAX_RECORDING_MS = 120_000L // 2 minutes
         private const val MAX_RECORDING_SECONDS = 120
+        private const val MAX_PHOTO_DIMENSION = 1600 // pixels, longest side
+        private const val PHOTO_JPEG_QUALITY = 80
     }
 }

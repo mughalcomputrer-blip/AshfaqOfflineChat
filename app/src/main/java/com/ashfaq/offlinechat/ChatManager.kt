@@ -46,6 +46,9 @@ class ChatManager(
 
         /** A voice message arrived; [filePath] points to our own copy of it. */
         fun onVoiceMessageReceived(filePath: String, durationSeconds: Int) {}
+
+        /** A photo arrived; [filePath] points to our own copy of it. */
+        fun onPhotoMessageReceived(filePath: String) {}
     }
 
     private val appContext: Context = context.applicationContext
@@ -76,6 +79,12 @@ class ChatManager(
     // Length (seconds) of the voice file that is on its way, told to us by
     // the small info message the sender sends just before the file.
     private var pendingVoiceDurationSeconds: Int? = null
+
+    // What kind of file is on its way (voice or photo), told to us by the
+    // small info message the sender sends just before every file. A file
+    // that arrives with no info is treated as voice, like before Phase 5.
+    private enum class IncomingFileKind { VOICE, PHOTO }
+    private var pendingFileKind: IncomingFileKind? = null
 
     fun isConnected(): Boolean = connectedEndpointId != null
 
@@ -138,12 +147,34 @@ class ChatManager(
         return true
     }
 
+    /**
+     * Sends a photo. Same pattern as voice: a file payload cannot carry any
+     * extra info, so we first send a tiny text info ("#PHOTO#" + file name)
+     * and then the image file itself.
+     */
+    fun sendPhotoMessage(file: File): Boolean {
+        val endpointId = connectedEndpointId ?: return false
+        val info = PHOTO_PREFIX + file.name
+        client.sendPayload(endpointId, Payload.fromBytes(info.toByteArray(Charsets.UTF_8)))
+            .addOnFailureListener { e -> listener.onError(describe(e)) }
+        val filePayload = try {
+            Payload.fromFile(file)
+        } catch (e: Exception) {
+            listener.onError("The photo could not be sent.")
+            return false
+        }
+        client.sendPayload(endpointId, filePayload)
+            .addOnFailureListener { e -> listener.onError(describe(e)) }
+        return true
+    }
+
     private fun stopEverything() {
         handler.removeCallbacks(reconnectRunnable)
         connectedEndpointId = null
         pendingEndpointId = null
         incomingFilePayloads.clear()
         pendingVoiceDurationSeconds = null
+        pendingFileKind = null
         client.stopAdvertising()
         client.stopDiscovery()
         client.stopAllEndpoints()
@@ -279,7 +310,17 @@ class ChatManager(
                     val raw = String(bytes, Charsets.UTF_8)
                     if (raw.startsWith(VOICE_PREFIX)) {
                         // Info about the voice file that follows.
-                        parseVoiceInfo(raw)?.let { pendingVoiceDurationSeconds = it }
+                        parseVoiceInfo(raw)?.let {
+                            pendingVoiceDurationSeconds = it
+                            pendingFileKind = IncomingFileKind.VOICE
+                        }
+                        return
+                    }
+                    if (raw.startsWith(PHOTO_PREFIX)) {
+                        // Info about the photo file that follows.
+                        if (isPhotoInfo(raw)) {
+                            pendingFileKind = IncomingFileKind.PHOTO
+                        }
                         return
                     }
                     val (messageId, text) = unpackMessage(raw)
@@ -299,11 +340,21 @@ class ChatManager(
             if (endpointId != connectedEndpointId) return
             if (update.status == PayloadTransferUpdate.Status.FAILURE) {
                 incomingFilePayloads.remove(update.payloadId)
+                // The file is gone, so its info message is stale too.
+                pendingFileKind = null
+                pendingVoiceDurationSeconds = null
                 listener.onError("A message could not be transferred.")
             } else if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
                 val filePayload = incomingFilePayloads.remove(update.payloadId)
                 if (filePayload != null) {
-                    saveReceivedVoiceFile(filePayload)
+                    // The info message said what kind of file this is. No
+                    // info (or a lost one) keeps the old behavior: voice.
+                    val kind = pendingFileKind ?: IncomingFileKind.VOICE
+                    pendingFileKind = null
+                    when (kind) {
+                        IncomingFileKind.VOICE -> saveReceivedVoiceFile(filePayload)
+                        IncomingFileKind.PHOTO -> saveReceivedPhotoFile(filePayload)
+                    }
                 }
             }
         }
@@ -319,6 +370,30 @@ class ChatManager(
         val separator = rest.indexOf('#')
         if (separator <= 0) return null
         return rest.substring(0, separator).toIntOrNull()
+    }
+
+    /**
+     * Checks a photo info text ("#PHOTO#" + file name). We only prepare
+     * ".jpg" files, so requiring that ending keeps a normal chat text that
+     * happens to start with the prefix from being mistaken for photo info.
+     */
+    private fun isPhotoInfo(raw: String): Boolean {
+        val name = raw.substring(PHOTO_PREFIX.length)
+        return name.isNotEmpty() && name.endsWith(".jpg", ignoreCase = true)
+    }
+
+    /** Copies a fully received photo into our own storage and shows it. */
+    private fun saveReceivedPhotoFile(payload: Payload) {
+        val filePart = payload.asFile() ?: return
+        val photoDir = File(appContext.filesDir, PHOTO_DIR_NAME)
+        if (!photoDir.exists()) photoDir.mkdirs()
+        val dest = File(photoDir, "photo_${System.currentTimeMillis()}.jpg")
+        if (!copyPayloadFile(filePart, dest) || !dest.exists() || dest.length() == 0L) {
+            dest.delete()
+            listener.onError("A photo could not be saved.")
+            return
+        }
+        listener.onPhotoMessageReceived(dest.absolutePath)
     }
 
     /** Copies a fully received voice file into our own storage and shows it. */
@@ -433,5 +508,7 @@ class ChatManager(
         private const val MAX_SEEN_MESSAGE_IDS = 200
         private const val VOICE_PREFIX = "#VOICE#"
         private const val VOICE_DIR_NAME = "voice"
+        private const val PHOTO_PREFIX = "#PHOTO#"
+        private const val PHOTO_DIR_NAME = "photos"
     }
 }

@@ -1,13 +1,18 @@
 package com.ashfaq.offlinechat
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaPlayer
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import java.text.SimpleDateFormat
@@ -31,6 +36,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val voiceRow: View = view.findViewById(R.id.voiceRow)
         val buttonPlay: ImageButton = view.findViewById(R.id.buttonPlay)
         val durationText: TextView = view.findViewById(R.id.durationText)
+        val photoImage: ImageView = view.findViewById(R.id.photoImage)
         val timeText: TextView = view.findViewById(R.id.timeText)
     }
 
@@ -81,23 +87,45 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         }
         holder.bubble.layoutParams = params
 
-        if (message.type == ChatMessage.Type.VOICE) {
-            holder.messageText.visibility = View.GONE
-            holder.voiceRow.visibility = View.VISIBLE
-            holder.durationText.text = formatDuration(message.durationSeconds)
-            val thisOnePlaying = playerPlaying && playingAudioPath == message.audioPath
-            holder.buttonPlay.setImageResource(
-                if (thisOnePlaying) {
-                    android.R.drawable.ic_media_pause
-                } else {
-                    android.R.drawable.ic_media_play
+        when (message.type) {
+            ChatMessage.Type.VOICE -> {
+                holder.messageText.visibility = View.GONE
+                holder.photoImage.visibility = View.GONE
+                holder.photoImage.setOnClickListener(null)
+                holder.voiceRow.visibility = View.VISIBLE
+                holder.durationText.text = formatDuration(message.durationSeconds)
+                val thisOnePlaying = playerPlaying && playingAudioPath == message.audioPath
+                holder.buttonPlay.setImageResource(
+                    if (thisOnePlaying) {
+                        android.R.drawable.ic_media_pause
+                    } else {
+                        android.R.drawable.ic_media_play
+                    }
+                )
+                holder.buttonPlay.setOnClickListener { togglePlay(message, position) }
+            }
+            ChatMessage.Type.PHOTO -> {
+                holder.messageText.visibility = View.GONE
+                holder.voiceRow.visibility = View.GONE
+                holder.buttonPlay.setOnClickListener(null)
+                holder.photoImage.visibility = View.VISIBLE
+                val path = message.imagePath
+                val thumbnailPx = (220 * context.resources.displayMetrics.density).toInt()
+                val thumbnail = path?.let {
+                    decodeSampledBitmap(it, thumbnailPx, thumbnailPx)
                 }
-            )
-            holder.buttonPlay.setOnClickListener { togglePlay(message, position) }
-        } else {
-            holder.messageText.visibility = View.VISIBLE
-            holder.voiceRow.visibility = View.GONE
-            holder.buttonPlay.setOnClickListener(null)
+                holder.photoImage.setImageBitmap(thumbnail)
+                holder.photoImage.setOnClickListener {
+                    if (path != null) showPhotoFullScreen(context, path)
+                }
+            }
+            ChatMessage.Type.TEXT -> {
+                holder.messageText.visibility = View.VISIBLE
+                holder.voiceRow.visibility = View.GONE
+                holder.photoImage.visibility = View.GONE
+                holder.photoImage.setOnClickListener(null)
+                holder.buttonPlay.setOnClickListener(null)
+            }
         }
     }
 
@@ -188,4 +216,66 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
 
     private fun formatDuration(totalSeconds: Int): String =
         String.format(Locale.getDefault(), "%d:%02d", totalSeconds / 60, totalSeconds % 60)
+
+    // ---------- Photos ----------
+
+    /**
+     * Loads a picture from [path] decoded only as large as asked for, so
+     * the chat list never holds a full-size photo in memory.
+     */
+    private fun decodeSampledBitmap(path: String, reqWidth: Int, reqHeight: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = calculateInSampleSize(
+                bounds.outWidth, bounds.outHeight, reqWidth, reqHeight
+            )
+        }
+        return try {
+            BitmapFactory.decodeFile(path, options)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun calculateInSampleSize(
+        width: Int,
+        height: Int,
+        reqWidth: Int,
+        reqHeight: Int
+    ): Int {
+        var inSampleSize = 1
+        if (height > reqHeight || width > reqWidth) {
+            val halfHeight = height / 2
+            val halfWidth = width / 2
+            while (
+                halfHeight / inSampleSize >= reqHeight &&
+                halfWidth / inSampleSize >= reqWidth
+            ) {
+                inSampleSize *= 2
+            }
+        }
+        return inSampleSize
+    }
+
+    /** Shows the tapped photo large, in a simple dialog. Tap OK to close. */
+    private fun showPhotoFullScreen(context: Context, path: String) {
+        val metrics = context.resources.displayMetrics
+        val bitmap = decodeSampledBitmap(path, metrics.widthPixels, metrics.heightPixels)
+            ?: return
+        val imageView = ImageView(context).apply {
+            setImageBitmap(bitmap)
+            adjustViewBounds = true
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            layoutParams = ViewGroup.LayoutParams(
+                metrics.widthPixels,
+                (metrics.heightPixels * 0.8).toInt()
+            )
+        }
+        AlertDialog.Builder(context)
+            .setView(imageView)
+            .setPositiveButton(android.R.string.ok) { dialog, _ -> dialog.dismiss() }
+            .show()
+    }
 }

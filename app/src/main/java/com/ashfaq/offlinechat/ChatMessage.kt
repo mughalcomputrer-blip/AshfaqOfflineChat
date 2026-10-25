@@ -8,7 +8,10 @@ data class ChatMessage(
     // Only used for voice messages: where the audio file lives on this
     // phone, and how long it is.
     val audioPath: String? = null,
-    val durationSeconds: Int = 0
+    val durationSeconds: Int = 0,
+    // Only used for photo messages: where the image file lives on this
+    // phone.
+    val imagePath: String? = null
 ) {
-    enum class Type { TEXT, VOICE }
+    enum class Type { TEXT, VOICE, PHOTO }
 }

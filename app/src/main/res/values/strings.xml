@@ -27,6 +27,10 @@
 <string name="not_connected_voice">Not connected. Voice message not recorded.</string>
 <string name="voice_recording_failed">Recording failed. Please try again.</string>
 <string name="voice_sent">Voice message sent</string>
+<string name="pick_photo">Send a photo</string>
+<string name="photo_message">Photo message</string>
+<string name="not_connected_photo">Not connected. Photo not sent.</string>
+<string name="photo_failed">The photo could not be sent.</string>
 <string name="error_generic">Error: %1$s</string>
 <string name="error_hint">Make sure Bluetooth and Location are turned on, and that the other phone is also searching.</string>
 

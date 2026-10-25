@@ -95,6 +95,16 @@
             android:textColorHint="@color/text_secondary" />
 
         <ImageButton
+            android:id="@+id/buttonPhoto"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"
+            android:background="@android:color/transparent"
+            android:contentDescription="@string/pick_photo"
+            android:src="@android:drawable/ic_menu_gallery"
+            android:tint="@color/primary" />
+
+        <ImageButton
             android:id="@+id/buttonMic"
             android:layout_width="48dp"
             android:layout_height="48dp"
