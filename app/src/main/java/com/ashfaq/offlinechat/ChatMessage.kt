@@ -16,7 +16,11 @@ data class ChatMessage(
     // the name it shows in the chat, and how big it is.
     val filePath: String? = null,
     val fileName: String? = null,
-    val fileSizeBytes: Long = 0
+    val fileSizeBytes: Long = 0,
+    // Who originally sent this message, in a group chat. Only set on
+    // received messages that carried a name; our own messages and
+    // messages from older app versions have none.
+    val senderName: String? = null
 ) {
     enum class Type { TEXT, VOICE, PHOTO, FILE }
 }

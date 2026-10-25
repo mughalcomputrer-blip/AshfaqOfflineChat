@@ -38,6 +38,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
 
     class MessageViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val bubble: View = view.findViewById(R.id.bubbleView)
+        val senderNameText: TextView = view.findViewById(R.id.senderNameText)
         val messageText: TextView = view.findViewById(R.id.messageText)
         val voiceRow: View = view.findViewById(R.id.voiceRow)
         val buttonPlay: ImageButton = view.findViewById(R.id.buttonPlay)
@@ -62,6 +63,17 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
 
         holder.messageText.text = message.text
         holder.timeText.text = timeFormat.format(Date(message.timestamp))
+
+        // In a group, a received message shows who originally sent it.
+        // Our own messages (and nameless ones from older versions) don't.
+        val senderName = message.senderName
+        if (!message.isSent && !senderName.isNullOrBlank()) {
+            holder.senderNameText.visibility = View.VISIBLE
+            holder.senderNameText.text = senderName
+        } else {
+            holder.senderNameText.visibility = View.GONE
+            holder.senderNameText.text = null
+        }
 
         val params = holder.bubble.layoutParams as LinearLayout.LayoutParams
         if (message.isSent) {

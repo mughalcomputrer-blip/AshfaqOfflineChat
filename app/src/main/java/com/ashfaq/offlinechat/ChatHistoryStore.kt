@@ -88,6 +88,7 @@ object ChatHistoryStore {
             message.filePath?.let { item.put("file", it) }
             message.fileName?.let { item.put("fname", it) }
             item.put("fsize", message.fileSizeBytes)
+            message.senderName?.let { item.put("from", it) }
             array.put(item)
         }
         return array.toString()
@@ -106,6 +107,13 @@ object ChatHistoryStore {
         // exactly as before.
         val filePath = if (item.isNull("file")) null else item.optString("file")
         val fileName = if (item.isNull("fname")) null else item.optString("fname")
+        // Older history files have no "from" key; those messages simply
+        // have no sender name, exactly as they were saved.
+        val senderName = if (item.isNull("from")) {
+            null
+        } else {
+            item.optString("from").takeIf { it.isNotEmpty() }
+        }
         // A voice, photo or file entry is only useful while its file is
         // still there; sent files lived in the cache and may be gone by now.
         when (type) {
@@ -127,7 +135,8 @@ object ChatHistoryStore {
             imagePath = imagePath,
             filePath = filePath,
             fileName = fileName,
-            fileSizeBytes = item.optLong("fsize", 0L)
+            fileSizeBytes = item.optLong("fsize", 0L),
+            senderName = senderName
         )
     }
 }

@@ -8,6 +8,7 @@
 <string name="status_searching">Searching for a nearby phone...</string>
 <string name="status_connecting">Connecting to %1$s...</string>
 <string name="status_connected">Connected to %1$s</string>
+<string name="status_hosting">Group host • %1$d connected</string>
 <string name="status_connected_already">Already connected. Tap Disconnect first.</string>
 <string name="status_disconnected">Disconnected. Tap Find Nearby Phone to reconnect.</string>
 <string name="status_reconnecting">Connection lost. Reconnecting (attempt %1$d of %2$d)...</string>

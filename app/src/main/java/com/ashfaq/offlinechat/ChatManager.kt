@@ -22,6 +22,23 @@ import com.google.android.gms.nearby.connection.Strategy
 import java.io.File
 import java.util.UUID
 
+/**
+ * The Nearby Connections side of the app, now for GROUPS (P2P_STAR).
+ *
+ * How a group forms: phones advertise and search like before, and the
+ * phone with the "smaller" name sends the connection request. Whoever
+ * ACCEPTS that first request becomes the group host (the "hub"): it
+ * keeps advertising — under a marked name that always sorts last — so
+ * more phones can find it and join. Whoever REQUESTED becomes a member
+ * ("spoke") and stops advertising/searching. Later phones discover the
+ * host's marked name, the name rule makes them request it, and the host
+ * gets the same accept dialog for every joiner (at most [MAX_SPOKES]).
+ *
+ * Messaging: a spoke only talks to the hub. The hub shows everything it
+ * receives and passes it on to the other spokes, so everyone in the
+ * group sees every message. Every payload carries the name of the
+ * person who originally sent it, so phones can label who said what.
+ */
 class ChatManager(
     context: Context,
     private val listener: Listener
@@ -38,17 +55,29 @@ class ChatManager(
         fun onConnecting(endpointName: String)
         fun onConnected(endpointName: String)
         fun onDisconnected()
-        fun onMessageReceived(text: String)
+
+        /**
+         * This phone is the group host and the member count changed.
+         * Replaces onConnected/onDisconnected for host-side updates.
+         */
+        fun onGroupHostUpdate(connectedCount: Int) {}
+
+        /** [senderName] is who originally wrote the message (null if unknown). */
+        fun onMessageReceived(text: String, senderName: String?)
         fun onError(message: String)
 
         /** The connection dropped and an automatic retry is about to happen. */
         fun onReconnecting(attempt: Int, maxAttempts: Int) {}
 
         /** A voice message arrived; [filePath] points to our own copy of it. */
-        fun onVoiceMessageReceived(filePath: String, durationSeconds: Int) {}
+        fun onVoiceMessageReceived(
+            filePath: String,
+            durationSeconds: Int,
+            senderName: String?
+        ) {}
 
         /** A photo arrived; [filePath] points to our own copy of it. */
-        fun onPhotoMessageReceived(filePath: String) {}
+        fun onPhotoMessageReceived(filePath: String, senderName: String?) {}
 
         /**
          * A file arrived; [filePath] points to our own copy of it, saved
@@ -57,13 +86,14 @@ class ChatManager(
         fun onFileMessageReceived(
             filePath: String,
             fileName: String,
-            fileSizeBytes: Long
+            fileSizeBytes: Long,
+            senderName: String?
         ) {}
     }
 
     private val appContext: Context = context.applicationContext
     private val client = Nearby.getConnectionsClient(context.applicationContext)
-    private val strategy = Strategy.P2P_POINT_TO_POINT
+    private val strategy = Strategy.P2P_STAR
     private val handler = Handler(Looper.getMainLooper())
 
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -99,13 +129,43 @@ class ChatManager(
         localName = buildLocalName()
     }
 
-    private var pendingEndpointId: String? = null
-    private var pendingName: String = ""
-    private var connectedEndpointId: String? = null
-    private var connectedName: String = ""
+    /**
+     * The display name we stamp into outgoing payloads, so the other
+     * phones can show who sent a message. '#' is removed because it is
+     * the field separator of the payload formats.
+     */
+    private fun wireSenderName(): String =
+        displayBaseName().replace('#', ' ').trim()
+            .take(MAX_SENDER_NAME_LENGTH).trim()
 
-    // Auto-reconnect state. autoReconnect turns true after the first
-    // successful connection and stays true until the user taps Disconnect.
+    // ----- Group state -----
+
+    /** What this phone currently is: not in a group, the host, or a member. */
+    private enum class Role { NONE, HUB, SPOKE }
+    private var role = Role.NONE
+
+    /** Connected phones: endpoint id -> their (display) name. */
+    private val connectedEndpoints = LinkedHashMap<String, String>()
+
+    /** The one endpoint we are currently asking to join, if any. */
+    private var pendingRequestId: String? = null
+
+    /** Display names of endpoints we are shaking hands with, by endpoint id. */
+    private val pendingNames = mutableMapOf<String, String>()
+
+    /** Endpoints whose join we accepted and are waiting to finish connecting. */
+    private val acceptedEndpointIds = mutableSetOf<String>()
+
+    /** A join request that is waiting for the accept dialog. */
+    private data class PendingRequest(val endpointId: String, val authDigits: String)
+
+    // Join requests are shown one at a time; the rest wait here.
+    private val pendingRequests = ArrayDeque<PendingRequest>()
+    private var activeRequestEndpointId: String? = null
+
+    // Auto-reconnect state (spokes only). autoReconnect turns true after
+    // the first successful connection and stays true until the user taps
+    // Disconnect. The host never reconnects; losing one member is normal.
     private var autoReconnect = false
     private var reconnectAttempts = 0
     private val reconnectRunnable = Runnable { start() }
@@ -116,25 +176,36 @@ class ChatManager(
     // File payloads that arrived and are still being transferred.
     private val incomingFilePayloads = mutableMapOf<Long, Payload>()
 
-    // Length (seconds) of the voice file that is on its way, told to us by
-    // the small info message the sender sends just before the file.
-    private var pendingVoiceDurationSeconds: Int? = null
+    // Which endpoint each incoming file payload came from, so its pieces
+    // can be cleaned up when that phone leaves the group.
+    private val filePayloadEndpoints = mutableMapOf<Long, String>()
 
-    // What kind of file is on its way (voice, photo or a general file),
-    // told to us by the small info message the sender sends just before
-    // every file. A file that arrives with no info is treated as voice,
+    // What kind of file is on its way, told to us by the small info
+    // message the sender sends just before every file. Kept per sending
+    // endpoint, because in a group two phones can send files around the
+    // same time. A file that arrives with no info is treated as voice,
     // like before Phase 5.
     private enum class IncomingFileKind { VOICE, PHOTO, FILE }
-    private var pendingFileKind: IncomingFileKind? = null
+    private data class PendingFileInfo(
+        val kind: IncomingFileKind,
+        val voiceDurationSeconds: Int?,
+        val fileName: String?,
+        val senderName: String?
+    )
+    private val pendingFiles = mutableMapOf<String, PendingFileInfo>()
 
-    // Original name of the general file that is on its way, told to us by
-    // its info message. Only used when pendingFileKind is FILE.
-    private var pendingFileName: String? = null
+    fun isConnected(): Boolean = connectedEndpoints.isNotEmpty()
 
-    fun isConnected(): Boolean = connectedEndpointId != null
-
-    /** Both phones advertise and search at the same time. */
+    /**
+     * Both phones advertise and search at the same time. A phone that is
+     * already hosting a group only makes sure it can still be found.
+     */
     fun start() {
+        if (role == Role.HUB) {
+            startHubAdvertising()
+            listener.onGroupHostUpdate(connectedEndpoints.size)
+            return
+        }
         stopEverything()
         listener.onSearching()
 
@@ -153,6 +224,25 @@ class ChatManager(
         ).addOnFailureListener { e -> fail(describe(e)) }
     }
 
+    /**
+     * (Re)starts advertising under the host's marked name. The marker
+     * makes the name sort after every normal name, so a searching phone
+     * always ends up requesting the host (the "smaller name requests"
+     * rule) and the host stays the host.
+     */
+    private fun startHubAdvertising() {
+        client.stopAdvertising()
+        val advertisingOptions = AdvertisingOptions.Builder()
+            .setStrategy(strategy)
+            .build()
+        client.startAdvertising(
+            HUB_NAME_PREFIX + localName, SERVICE_ID, connectionCallback, advertisingOptions
+        ).addOnFailureListener { e ->
+            listener.onError(describe(e))
+            listener.onGroupHostUpdate(connectedEndpoints.size)
+        }
+    }
+
     fun disconnect() {
         autoReconnect = false
         reconnectAttempts = 0
@@ -160,13 +250,32 @@ class ChatManager(
         listener.onDisconnected()
     }
 
+    /** Who an outgoing message goes to: for the host everyone in the
+     *  group (except [exclude]), for a member just its one connection
+     *  (the host), for a lone phone its one connection if it has one. */
+    private fun sendTargets(exclude: String? = null): List<String> =
+        if (role == Role.HUB) {
+            connectedEndpoints.keys.filter { it != exclude }
+        } else {
+            connectedEndpoints.keys.toList()
+        }
+
     fun sendMessage(text: String): Boolean {
-        val endpointId = connectedEndpointId ?: return false
-        // Every message carries its own random id, so the other phone can
-        // spot and drop the same message if it is ever delivered twice.
-        val wireText = MESSAGE_ID_PREFIX + UUID.randomUUID().toString() + text
+        val targets = sendTargets()
+        if (targets.isEmpty()) return false
+        // Every message carries its own random id, so the other phones can
+        // spot and drop the same message if it is ever delivered twice,
+        // plus the sender's name, so group members can see who wrote it.
+        // Old format "#ID#" + uuid + text still works on the other side.
+        val id = UUID.randomUUID().toString()
+        val name = wireSenderName()
+        val wireText = if (name.isEmpty()) {
+            MESSAGE_ID_PREFIX + id + text
+        } else {
+            MESSAGE_ID_PREFIX + id + FROM_INFIX + name + "#" + text
+        }
         val payload = Payload.fromBytes(wireText.toByteArray(Charsets.UTF_8))
-        client.sendPayload(endpointId, payload)
+        client.sendPayload(targets, payload)
             .addOnFailureListener { e -> listener.onError(describe(e)) }
         return true
     }
@@ -174,76 +283,95 @@ class ChatManager(
     /**
      * Sends a recorded voice message. A file payload cannot carry any extra
      * info, so we first send a tiny text info ("#VOICE#" + seconds + "#" +
-     * file name) and then the audio file itself.
+     * sender name + "#" + file name) and then the audio file itself.
      */
     fun sendVoiceMessage(file: File, durationSeconds: Int): Boolean {
-        val endpointId = connectedEndpointId ?: return false
-        val info = VOICE_PREFIX + durationSeconds + "#" + file.name
-        client.sendPayload(endpointId, Payload.fromBytes(info.toByteArray(Charsets.UTF_8)))
-            .addOnFailureListener { e -> listener.onError(describe(e)) }
-        val filePayload = try {
-            Payload.fromFile(file)
-        } catch (e: Exception) {
-            listener.onError("The voice message could not be sent.")
-            return false
+        val targets = sendTargets()
+        if (targets.isEmpty()) return false
+        val name = wireSenderName()
+        val info = if (name.isEmpty()) {
+            VOICE_PREFIX + durationSeconds + "#" + file.name
+        } else {
+            VOICE_PREFIX + durationSeconds + "#" + name + "#" + file.name
         }
-        client.sendPayload(endpointId, filePayload)
-            .addOnFailureListener { e -> listener.onError(describe(e)) }
-        return true
+        return sendInfoAndFile(targets, info, file, "The voice message could not be sent.")
     }
 
     /**
      * Sends a photo. Same pattern as voice: a file payload cannot carry any
-     * extra info, so we first send a tiny text info ("#PHOTO#" + file name)
-     * and then the image file itself.
+     * extra info, so we first send a tiny text info ("#PHOTO#" + sender
+     * name + "#" + file name) and then the image file itself.
      */
     fun sendPhotoMessage(file: File): Boolean {
-        val endpointId = connectedEndpointId ?: return false
-        val info = PHOTO_PREFIX + file.name
-        client.sendPayload(endpointId, Payload.fromBytes(info.toByteArray(Charsets.UTF_8)))
-            .addOnFailureListener { e -> listener.onError(describe(e)) }
-        val filePayload = try {
-            Payload.fromFile(file)
-        } catch (e: Exception) {
-            listener.onError("The photo could not be sent.")
-            return false
+        val targets = sendTargets()
+        if (targets.isEmpty()) return false
+        val name = wireSenderName()
+        val info = if (name.isEmpty()) {
+            PHOTO_PREFIX + file.name
+        } else {
+            PHOTO_PREFIX + name + "#" + file.name
         }
-        client.sendPayload(endpointId, filePayload)
-            .addOnFailureListener { e -> listener.onError(describe(e)) }
-        return true
+        return sendInfoAndFile(targets, info, file, "The photo could not be sent.")
     }
 
     /**
      * Sends any file (a PDF, a document, ...). Same pattern as voice and
      * photo: a file payload cannot carry any extra info, so we first send
-     * a tiny text info ("#FILE#" + the file's original name) and then the
-     * file itself. The file must already carry its final name, because
-     * that name is what the other phone saves and shows.
+     * a tiny text info ("#FILE#" + sender name + "#" + the file's original
+     * name) and then the file itself. The file must already carry its
+     * final name, because that name is what the other phones save and show.
      */
     fun sendFileMessage(file: File): Boolean {
-        val endpointId = connectedEndpointId ?: return false
-        val info = FILE_PREFIX + file.name
-        client.sendPayload(endpointId, Payload.fromBytes(info.toByteArray(Charsets.UTF_8)))
-            .addOnFailureListener { e -> listener.onError(describe(e)) }
+        val targets = sendTargets()
+        if (targets.isEmpty()) return false
+        val name = wireSenderName()
+        val info = if (name.isEmpty()) {
+            FILE_PREFIX + file.name
+        } else {
+            FILE_PREFIX + name + "#" + file.name
+        }
+        return sendInfoAndFile(targets, info, file, "The file could not be sent.")
+    }
+
+    /**
+     * Sends one info text and then one file to all [targets]. Used for
+     * our own sends ([errorMessage] is shown when the file itself cannot
+     * even be started) and for the host passing a received file on to the
+     * rest of the group (then there is no useful error to show, so
+     * [errorMessage] is null and a failure stays silent).
+     */
+    private fun sendInfoAndFile(
+        targets: List<String>,
+        info: String,
+        file: File,
+        errorMessage: String?
+    ): Boolean {
+        if (targets.isEmpty()) return false
         val filePayload = try {
             Payload.fromFile(file)
         } catch (e: Exception) {
-            listener.onError("The file could not be sent.")
+            if (errorMessage != null) listener.onError(errorMessage)
             return false
         }
-        client.sendPayload(endpointId, filePayload)
+        client.sendPayload(targets, Payload.fromBytes(info.toByteArray(Charsets.UTF_8)))
+            .addOnFailureListener { e -> listener.onError(describe(e)) }
+        client.sendPayload(targets, filePayload)
             .addOnFailureListener { e -> listener.onError(describe(e)) }
         return true
     }
 
     private fun stopEverything() {
         handler.removeCallbacks(reconnectRunnable)
-        connectedEndpointId = null
-        pendingEndpointId = null
+        role = Role.NONE
+        connectedEndpoints.clear()
+        pendingRequestId = null
+        pendingNames.clear()
+        acceptedEndpointIds.clear()
+        pendingRequests.clear()
+        activeRequestEndpointId = null
         incomingFilePayloads.clear()
-        pendingVoiceDurationSeconds = null
-        pendingFileKind = null
-        pendingFileName = null
+        filePayloadEndpoints.clear()
+        pendingFiles.clear()
         client.stopAdvertising()
         client.stopDiscovery()
         client.stopAllEndpoints()
@@ -261,7 +389,7 @@ class ChatManager(
      * the normal disconnected state. It never loops forever.
      */
     private fun scheduleReconnectOrGiveUp() {
-        pendingEndpointId = null
+        pendingRequestId = null
         if (!autoReconnect || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
             reconnectAttempts = 0
             stopEverything()
@@ -276,18 +404,90 @@ class ChatManager(
 
     private fun describe(e: Exception): String = e.message ?: e.toString()
 
+    /** The endpoint name without the host marker, for showing to the user. */
+    private fun visibleName(rawName: String): String = rawName.removePrefix(HUB_NAME_PREFIX)
+
+    // ----- Join requests (accept dialog, one at a time) -----
+
+    /** Shows the next waiting join request, if no dialog is open. */
+    private fun presentNextRequestIfIdle() {
+        if (activeRequestEndpointId != null) return
+        while (pendingRequests.isNotEmpty()) {
+            val next = pendingRequests.first()
+            // A member accepts nobody, and a full host takes nobody new;
+            // such waiting requests are simply turned away.
+            if (role == Role.SPOKE ||
+                (role == Role.HUB && connectedEndpoints.size >= MAX_SPOKES)
+            ) {
+                pendingRequests.removeFirst()
+                client.rejectConnection(next.endpointId)
+                pendingNames.remove(next.endpointId)
+                continue
+            }
+            pendingRequests.removeFirst()
+            activeRequestEndpointId = next.endpointId
+            listener.onConnectionRequest(
+                endpointName = pendingNames[next.endpointId] ?: "",
+                authDigits = next.authDigits,
+                accept = { acceptPendingRequest(next.endpointId) },
+                reject = { rejectPendingRequest(next.endpointId) }
+            )
+            return
+        }
+    }
+
+    private fun acceptPendingRequest(endpointId: String) {
+        if (activeRequestEndpointId == endpointId) activeRequestEndpointId = null
+        acceptedEndpointIds.add(endpointId)
+        listener.onConnecting(pendingNames[endpointId] ?: "")
+        client.acceptConnection(endpointId, payloadCallback)
+            .addOnFailureListener { e ->
+                acceptedEndpointIds.remove(endpointId)
+                if (role == Role.HUB) {
+                    // One join failed; the group itself carries on.
+                    presentNextRequestIfIdle()
+                } else {
+                    fail(describe(e))
+                }
+            }
+        // The next waiting request is shown when this one finishes
+        // connecting (or fails), so handshakes stay one at a time.
+    }
+
+    private fun rejectPendingRequest(endpointId: String) {
+        if (activeRequestEndpointId == endpointId) activeRequestEndpointId = null
+        client.rejectConnection(endpointId)
+        pendingNames.remove(endpointId)
+        // Restore the state line for the role we are in now.
+        if (role == Role.HUB) {
+            listener.onGroupHostUpdate(connectedEndpoints.size)
+        } else {
+            listener.onSearching()
+        }
+        presentNextRequestIfIdle()
+    }
+
     private val discoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
-            if (connectedEndpointId != null || pendingEndpointId != null) return
+            // Only a phone that is not in a group yet goes looking for one,
+            // and only one request at a time (the accept dialog included).
+            if (role != Role.NONE || pendingRequestId != null ||
+                activeRequestEndpointId != null || pendingRequests.isNotEmpty()
+            ) {
+                return
+            }
 
             // Only the phone with the "smaller" name sends the request,
-            // so the two phones do not request each other at once.
+            // so the two phones do not request each other at once. The
+            // host's marked name always sorts last, so a searching phone
+            // always requests the host when it finds one.
             if (localName <= info.endpointName) {
-                pendingEndpointId = endpointId
-                pendingName = info.endpointName
+                pendingRequestId = endpointId
+                pendingNames[endpointId] = visibleName(info.endpointName)
                 client.requestConnection(localName, endpointId, connectionCallback)
                     .addOnFailureListener { e ->
-                        pendingEndpointId = null
+                        pendingRequestId = null
+                        pendingNames.remove(endpointId)
                         if (reconnectAttempts > 0) {
                             // A reconnect attempt failed; try again or give up.
                             scheduleReconnectOrGiveUp()
@@ -305,42 +505,72 @@ class ChatManager(
 
     private val connectionCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
-            val busyWithOther = connectedEndpointId != null ||
-                (pendingEndpointId != null && pendingEndpointId != endpointId)
+            if (connectedEndpoints.containsKey(endpointId)) {
+                client.rejectConnection(endpointId)
+                return
+            }
+            val busyWithOther = when {
+                // The (defensive) case of both phones asking each other at
+                // once: the request from the phone we asked is let through,
+                // like before.
+                endpointId == pendingRequestId -> false
+                // A member of a group accepts nobody new.
+                role == Role.SPOKE -> true
+                // A full group takes nobody new; the joiner is told the
+                // connection was rejected.
+                role == Role.HUB && connectedEndpoints.size >= MAX_SPOKES -> true
+                // A phone that is already asking someone else stays busy.
+                role == Role.NONE && pendingRequestId != null -> true
+                else -> false
+            }
             if (busyWithOther) {
                 client.rejectConnection(endpointId)
                 return
             }
 
-            pendingEndpointId = endpointId
-            pendingName = info.endpointName
-
-            listener.onConnectionRequest(
-                endpointName = info.endpointName,
-                authDigits = info.authenticationDigits,
-                accept = {
-                    listener.onConnecting(info.endpointName)
-                    client.acceptConnection(endpointId, payloadCallback)
-                        .addOnFailureListener { e -> fail(describe(e)) }
-                },
-                reject = {
-                    client.rejectConnection(endpointId)
-                    pendingEndpointId = null
-                }
+            pendingNames[endpointId] = visibleName(info.endpointName)
+            pendingRequests.addLast(
+                PendingRequest(endpointId, info.authenticationDigits)
             )
+            presentNextRequestIfIdle()
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             val code = result.status.statusCode
+            val roleBefore = role
+            val wasRequestedByUs = endpointId == pendingRequestId
+            if (wasRequestedByUs) pendingRequestId = null
+            val wasAcceptedByUs = acceptedEndpointIds.remove(endpointId)
+            val name = pendingNames.remove(endpointId) ?: ""
+
             if (code == ConnectionsStatusCodes.STATUS_OK) {
-                connectedEndpointId = endpointId
-                connectedName = pendingName
-                pendingEndpointId = null
-                autoReconnect = true
+                // Whoever asked joins as a member; whoever accepted the
+                // first request becomes (or stays) the host.
+                role = when {
+                    roleBefore == Role.HUB -> Role.HUB
+                    wasRequestedByUs -> Role.SPOKE
+                    wasAcceptedByUs -> Role.HUB
+                    else -> Role.SPOKE
+                }
+                connectedEndpoints[endpointId] = name
                 reconnectAttempts = 0
-                client.stopAdvertising()
-                client.stopDiscovery()
-                listener.onConnected(connectedName)
+                if (role == Role.HUB) {
+                    autoReconnect = false
+                    client.stopDiscovery()
+                    if (roleBefore != Role.HUB) {
+                        // We just became the host: advertise under the
+                        // marked host name, so more phones can join.
+                        startHubAdvertising()
+                    }
+                    listener.onGroupHostUpdate(connectedEndpoints.size)
+                } else {
+                    autoReconnect = true
+                    client.stopAdvertising()
+                    client.stopDiscovery()
+                    listener.onConnected(name)
+                }
+            } else if (roleBefore == Role.HUB) {
+                // One join did not work out; the group carries on.
             } else if (code == ConnectionsStatusCodes.STATUS_CONNECTION_REJECTED) {
                 // The other person said no, so retrying makes no sense.
                 fail("The connection was rejected.")
@@ -350,15 +580,38 @@ class ChatManager(
             } else {
                 fail("Connection failed (code $code).")
             }
+            if (wasAcceptedByUs) presentNextRequestIfIdle()
         }
 
         override fun onDisconnected(endpointId: String) {
-            if (endpointId == connectedEndpointId) {
-                connectedEndpointId = null
-                if (autoReconnect) {
-                    scheduleReconnectOrGiveUp()
-                } else {
-                    listener.onDisconnected()
+            pendingNames.remove(endpointId)
+            acceptedEndpointIds.remove(endpointId)
+            if (endpointId == pendingRequestId) pendingRequestId = null
+
+            if (!connectedEndpoints.containsKey(endpointId)) return
+            connectedEndpoints.remove(endpointId)
+            // The phone is gone, so the info about a file it was sending
+            // and any half-arrived file of it are stale now.
+            pendingFiles.remove(endpointId)
+            val iterator = filePayloadEndpoints.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.value == endpointId) {
+                    incomingFilePayloads.remove(entry.key)
+                    iterator.remove()
+                }
+            }
+            when (role) {
+                Role.HUB -> {
+                    // One member left; the group carries on.
+                    listener.onGroupHostUpdate(connectedEndpoints.size)
+                }
+                else -> {
+                    if (autoReconnect) {
+                        scheduleReconnectOrGiveUp()
+                    } else {
+                        listener.onDisconnected()
+                    }
                 }
             }
         }
@@ -366,13 +619,14 @@ class ChatManager(
 
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
-            // Ignore anything that does not come from the phone we accepted.
-            if (endpointId != connectedEndpointId) return
+            // Ignore anything that does not come from a phone in our group.
+            if (!connectedEndpoints.containsKey(endpointId)) return
             when (payload.type) {
                 Payload.Type.FILE -> {
                     // Remember the file; it is usable once the transfer
                     // finishes with SUCCESS in onPayloadTransferUpdate.
                     incomingFilePayloads[payload.id] = payload
+                    filePayloadEndpoints[payload.id] = endpointId
                 }
                 Payload.Type.BYTES -> {
                     val bytes = payload.asBytes() ?: return
@@ -380,35 +634,41 @@ class ChatManager(
                     if (raw.startsWith(VOICE_PREFIX)) {
                         // Info about the voice file that follows.
                         parseVoiceInfo(raw)?.let {
-                            pendingVoiceDurationSeconds = it
-                            pendingFileKind = IncomingFileKind.VOICE
-                            pendingFileName = null
+                            pendingFiles[endpointId] = it
                         }
                         return
                     }
                     if (raw.startsWith(PHOTO_PREFIX)) {
                         // Info about the photo file that follows.
-                        if (isPhotoInfo(raw)) {
-                            pendingFileKind = IncomingFileKind.PHOTO
-                            pendingFileName = null
+                        parsePhotoInfo(raw)?.let {
+                            pendingFiles[endpointId] = it
                         }
                         return
                     }
                     if (raw.startsWith(FILE_PREFIX)) {
                         // Info about the general file that follows.
-                        val name = parseFileInfo(raw)
-                        if (name != null) {
-                            pendingFileKind = IncomingFileKind.FILE
-                            pendingFileName = name
-                            pendingVoiceDurationSeconds = null
+                        parseFileInfo(raw)?.let {
+                            pendingFiles[endpointId] = it
                         }
                         return
                     }
-                    val (messageId, text) = unpackMessage(raw)
-                    if (messageId != null && !rememberMessageId(messageId)) {
+                    val message = unpackMessage(raw)
+                    if (message.id != null && !rememberMessageId(message.id)) {
                         return // We already showed this message once.
                     }
-                    listener.onMessageReceived(text)
+                    listener.onMessageReceived(message.text, message.senderName)
+                    if (role == Role.HUB) {
+                        // The host passes every member's message on to the
+                        // rest of the group, word for word (same id, same
+                        // sender name), so everyone sees the same chat.
+                        val targets = sendTargets(exclude = endpointId)
+                        if (targets.isNotEmpty()) {
+                            client.sendPayload(
+                                targets,
+                                Payload.fromBytes(bytes)
+                            ).addOnFailureListener { e -> listener.onError(describe(e)) }
+                        }
+                    }
                 }
                 else -> Unit
             }
@@ -418,62 +678,171 @@ class ChatManager(
             endpointId: String,
             update: PayloadTransferUpdate
         ) {
-            if (endpointId != connectedEndpointId) return
+            if (!connectedEndpoints.containsKey(endpointId)) return
             if (update.status == PayloadTransferUpdate.Status.FAILURE) {
-                incomingFilePayloads.remove(update.payloadId)
-                // The file is gone, so its info message is stale too.
-                pendingFileKind = null
-                pendingFileName = null
-                pendingVoiceDurationSeconds = null
+                val wasIncoming = incomingFilePayloads.remove(update.payloadId) != null
+                filePayloadEndpoints.remove(update.payloadId)
+                if (wasIncoming) {
+                    // The file is gone, so its info message is stale too.
+                    pendingFiles.remove(endpointId)
+                }
                 listener.onError("A message could not be transferred.")
             } else if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
                 val filePayload = incomingFilePayloads.remove(update.payloadId)
+                filePayloadEndpoints.remove(update.payloadId)
                 if (filePayload != null) {
                     // The info message said what kind of file this is. No
                     // info (or a lost one) keeps the old behavior: voice.
-                    val kind = pendingFileKind ?: IncomingFileKind.VOICE
-                    pendingFileKind = null
-                    when (kind) {
-                        IncomingFileKind.VOICE -> saveReceivedVoiceFile(filePayload)
-                        IncomingFileKind.PHOTO -> saveReceivedPhotoFile(filePayload)
-                        IncomingFileKind.FILE -> saveReceivedFile(filePayload)
+                    val info = pendingFiles.remove(endpointId)
+                    when (info?.kind ?: IncomingFileKind.VOICE) {
+                        IncomingFileKind.VOICE -> {
+                            val dest = saveReceivedVoiceFile(filePayload) ?: return
+                            val duration = info?.voiceDurationSeconds
+                                ?: fileDurationSeconds(dest)
+                            listener.onVoiceMessageReceived(
+                                dest.absolutePath, duration, info?.senderName
+                            )
+                            if (role == Role.HUB) {
+                                relayVoiceFile(dest, duration, info?.senderName, endpointId)
+                            }
+                        }
+                        IncomingFileKind.PHOTO -> {
+                            val dest = saveReceivedPhotoFile(filePayload) ?: return
+                            listener.onPhotoMessageReceived(
+                                dest.absolutePath, info?.senderName
+                            )
+                            if (role == Role.HUB) {
+                                relayPhotoFile(dest, info?.senderName, endpointId)
+                            }
+                        }
+                        IncomingFileKind.FILE -> {
+                            val dest = saveReceivedFile(filePayload, info?.fileName) ?: return
+                            listener.onFileMessageReceived(
+                                dest.absolutePath, dest.name, dest.length(), info?.senderName
+                            )
+                            if (role == Role.HUB) {
+                                relayFile(dest, info?.senderName, endpointId)
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    /**
-     * Reads the length in seconds out of a voice info text
-     * ("#VOICE#" + seconds + "#" + file name). Null when it does not parse;
-     * the length is then read from the audio file itself instead.
-     */
-    private fun parseVoiceInfo(raw: String): Int? {
-        val rest = raw.substring(VOICE_PREFIX.length)
-        val separator = rest.indexOf('#')
-        if (separator <= 0) return null
-        return rest.substring(0, separator).toIntOrNull()
+    // ----- Host relaying of received files -----
+    // The host re-sends a fully received file (its own saved copy) to all
+    // other members, always with the ORIGINAL sender's name in the info
+    // text. Members never pass files on.
+
+    private fun relayVoiceFile(
+        file: File,
+        durationSeconds: Int,
+        senderName: String?,
+        exceptEndpointId: String
+    ) {
+        val targets = sendTargets(exclude = exceptEndpointId)
+        if (targets.isEmpty()) return
+        val info = if (senderName.isNullOrEmpty()) {
+            VOICE_PREFIX + durationSeconds + "#" + file.name
+        } else {
+            VOICE_PREFIX + durationSeconds + "#" + senderName + "#" + file.name
+        }
+        sendInfoAndFile(targets, info, file, null)
+    }
+
+    private fun relayPhotoFile(
+        file: File,
+        senderName: String?,
+        exceptEndpointId: String
+    ) {
+        val targets = sendTargets(exclude = exceptEndpointId)
+        if (targets.isEmpty()) return
+        val info = if (senderName.isNullOrEmpty()) {
+            PHOTO_PREFIX + file.name
+        } else {
+            PHOTO_PREFIX + senderName + "#" + file.name
+        }
+        sendInfoAndFile(targets, info, file, null)
+    }
+
+    private fun relayFile(
+        file: File,
+        senderName: String?,
+        exceptEndpointId: String
+    ) {
+        val targets = sendTargets(exclude = exceptEndpointId)
+        if (targets.isEmpty()) return
+        val info = if (senderName.isNullOrEmpty()) {
+            FILE_PREFIX + file.name
+        } else {
+            FILE_PREFIX + senderName + "#" + file.name
+        }
+        sendInfoAndFile(targets, info, file, null)
     }
 
     /**
-     * Checks a photo info text ("#PHOTO#" + file name). We only prepare
-     * ".jpg" files, so requiring that ending keeps a normal chat text that
+     * Reads a voice info text. New form: "#VOICE#" + seconds + "#" +
+     * sender name + "#" + file name. Old form: "#VOICE#" + seconds + "#"
+     * + file name. Null when it does not parse at all; the length is
+     * then read from the audio file itself instead.
+     */
+    private fun parseVoiceInfo(raw: String): PendingFileInfo? {
+        val parts = raw.substring(VOICE_PREFIX.length).split('#')
+        if (parts.size < 2 || parts[0].isEmpty()) return null
+        return PendingFileInfo(
+            kind = IncomingFileKind.VOICE,
+            voiceDurationSeconds = parts[0].toIntOrNull(),
+            fileName = null,
+            senderName = if (parts.size >= 3) parts[1].takeIf { it.isNotEmpty() } else null
+        )
+    }
+
+    /**
+     * Reads a photo info text. New form: "#PHOTO#" + sender name + "#" +
+     * file name. Old form: "#PHOTO#" + file name. We only prepare ".jpg"
+     * files, so requiring that ending keeps a normal chat text that
      * happens to start with the prefix from being mistaken for photo info.
      */
-    private fun isPhotoInfo(raw: String): Boolean {
-        val name = raw.substring(PHOTO_PREFIX.length)
-        return name.isNotEmpty() && name.endsWith(".jpg", ignoreCase = true)
+    private fun parsePhotoInfo(raw: String): PendingFileInfo? {
+        val rest = raw.substring(PHOTO_PREFIX.length)
+        val separator = rest.indexOf('#')
+        if (separator > 0) {
+            val name = rest.substring(0, separator)
+            val fileName = rest.substring(separator + 1)
+            if (fileName.endsWith(".jpg", ignoreCase = true)) {
+                return PendingFileInfo(IncomingFileKind.PHOTO, null, null, name)
+            }
+            return null
+        }
+        if (rest.isNotEmpty() && rest.endsWith(".jpg", ignoreCase = true)) {
+            return PendingFileInfo(IncomingFileKind.PHOTO, null, null, null)
+        }
+        return null
     }
 
     /**
-     * Reads the file name out of a file info text ("#FILE#" + file name).
-     * The name is cleaned with [sanitizeFileName]; null when nothing sane
-     * is left, so a normal chat text that happens to start with the prefix
-     * is never mistaken for file info.
+     * Reads a file info text. New form: "#FILE#" + sender name + "#" +
+     * file name (split at the FIRST '#', because a file name may itself
+     * contain one). Old form: "#FILE#" + file name. The name is cleaned
+     * with [sanitizeFileName]; null when nothing sane is left, so a
+     * normal chat text that happens to start with the prefix is never
+     * mistaken for file info.
      */
-    private fun parseFileInfo(raw: String): String? {
-        val name = sanitizeFileName(raw.substring(FILE_PREFIX.length))
-        return name.takeIf { it.isNotEmpty() }
+    private fun parseFileInfo(raw: String): PendingFileInfo? {
+        val rest = raw.substring(FILE_PREFIX.length)
+        val separator = rest.indexOf('#')
+        if (separator > 0) {
+            val senderName = rest.substring(0, separator)
+            val fileName = sanitizeFileName(rest.substring(separator + 1))
+            if (fileName.isNotEmpty()) {
+                return PendingFileInfo(IncomingFileKind.FILE, null, fileName, senderName)
+            }
+            return null
+        }
+        val fileName = sanitizeFileName(rest)
+        if (fileName.isEmpty()) return null
+        return PendingFileInfo(IncomingFileKind.FILE, null, fileName, null)
     }
 
     /**
@@ -481,20 +850,17 @@ class ChatManager(
      * its original name. When a file with that name is already there, a
      * suffix like " (1)" is added, so an older file is never overwritten.
      */
-    private fun saveReceivedFile(payload: Payload) {
-        val filePart = payload.asFile() ?: return
+    private fun saveReceivedFile(payload: Payload, wantedName: String?): File? {
+        val filePart = payload.asFile() ?: return null
         val fileDir = File(appContext.filesDir, FILE_DIR_NAME)
         if (!fileDir.exists()) fileDir.mkdirs()
-        val wantedName = pendingFileName
-            ?: "file_${System.currentTimeMillis()}"
-        pendingFileName = null
-        val dest = uniqueFile(fileDir, wantedName)
+        val dest = uniqueFile(fileDir, wantedName ?: "file_${System.currentTimeMillis()}")
         if (!copyPayloadFile(filePart, dest) || !dest.exists() || dest.length() == 0L) {
             dest.delete()
             listener.onError("A file could not be saved.")
-            return
+            return null
         }
-        listener.onFileMessageReceived(dest.absolutePath, dest.name, dest.length())
+        return dest
     }
 
     /** Finds a free name in [dir]: the name itself, or "name (1)", ... */
@@ -512,35 +878,32 @@ class ChatManager(
         return candidate
     }
 
-    /** Copies a fully received photo into our own storage and shows it. */
-    private fun saveReceivedPhotoFile(payload: Payload) {
-        val filePart = payload.asFile() ?: return
+    /** Copies a fully received photo into our own storage. */
+    private fun saveReceivedPhotoFile(payload: Payload): File? {
+        val filePart = payload.asFile() ?: return null
         val photoDir = File(appContext.filesDir, PHOTO_DIR_NAME)
         if (!photoDir.exists()) photoDir.mkdirs()
         val dest = File(photoDir, "photo_${System.currentTimeMillis()}.jpg")
         if (!copyPayloadFile(filePart, dest) || !dest.exists() || dest.length() == 0L) {
             dest.delete()
             listener.onError("A photo could not be saved.")
-            return
+            return null
         }
-        listener.onPhotoMessageReceived(dest.absolutePath)
+        return dest
     }
 
-    /** Copies a fully received voice file into our own storage and shows it. */
-    private fun saveReceivedVoiceFile(payload: Payload) {
-        val filePart = payload.asFile() ?: return
+    /** Copies a fully received voice file into our own storage. */
+    private fun saveReceivedVoiceFile(payload: Payload): File? {
+        val filePart = payload.asFile() ?: return null
         val voiceDir = File(appContext.filesDir, VOICE_DIR_NAME)
         if (!voiceDir.exists()) voiceDir.mkdirs()
         val dest = File(voiceDir, "voice_${System.currentTimeMillis()}.m4a")
         if (!copyPayloadFile(filePart, dest) || !dest.exists() || dest.length() == 0L) {
             dest.delete()
             listener.onError("A voice message could not be saved.")
-            return
+            return null
         }
-        // Prefer the length the sender told us; fall back to the file itself.
-        val duration = pendingVoiceDurationSeconds ?: fileDurationSeconds(dest)
-        pendingVoiceDurationSeconds = null
-        listener.onVoiceMessageReceived(dest.absolutePath, duration)
+        return dest
     }
 
     private fun copyPayloadFile(filePart: Payload.File, dest: File): Boolean {
@@ -598,13 +961,21 @@ class ChatManager(
         }
     }
 
+    /** A received text message, split into its parts. */
+    private data class UnpackedMessage(
+        val id: String?,
+        val senderName: String?,
+        val text: String
+    )
+
     /**
-     * Splits a received payload into its message id and the real text.
-     * New messages look like "#ID#" + a 36-char UUID + the text. Anything
-     * else (for example a plain message from an older app version) has no
-     * id and is shown as-is.
+     * Splits a received payload into its message id, the sender's name
+     * and the real text. New messages look like "#ID#" + a 36-char UUID +
+     * "#FROM#" + sender name + "#" + the text. Older messages have no
+     * "#FROM#" part (the name is then unknown), and a plain payload with
+     * no id at all (from a very old app version) is shown as-is.
      */
-    private fun unpackMessage(raw: String): Pair<String?, String> {
+    private fun unpackMessage(raw: String): UnpackedMessage {
         val idStart = MESSAGE_ID_PREFIX.length
         val idEnd = idStart + MESSAGE_ID_LENGTH
         if (raw.length >= idEnd && raw.startsWith(MESSAGE_ID_PREFIX)) {
@@ -612,10 +983,22 @@ class ChatManager(
             // A real UUID has dashes at fixed places; this check keeps
             // normal text that happens to start with the prefix safe.
             if (id[8] == '-' && id[13] == '-' && id[18] == '-' && id[23] == '-') {
-                return id to raw.substring(idEnd)
+                var rest = raw.substring(idEnd)
+                var senderName: String? = null
+                if (rest.startsWith(FROM_INFIX)) {
+                    val afterFrom = rest.substring(FROM_INFIX.length)
+                    val separator = afterFrom.indexOf('#')
+                    if (separator >= 0) {
+                        senderName = afterFrom.substring(0, separator)
+                            .takeIf { it.isNotEmpty() }
+                        rest = afterFrom.substring(separator + 1)
+                    }
+                    // No closing '#' at all: malformed; keep rest as-is.
+                }
+                return UnpackedMessage(id, senderName, rest)
             }
         }
-        return null to raw
+        return UnpackedMessage(null, null, raw)
     }
 
     /** Remembers a message id. Returns false when the id was already seen. */
@@ -634,8 +1017,10 @@ class ChatManager(
         private const val MAX_RECONNECT_ATTEMPTS = 3
         private const val RECONNECT_DELAY_MS = 3_000L
         private const val MESSAGE_ID_PREFIX = "#ID#"
+        private const val FROM_INFIX = "#FROM#"
         private const val MESSAGE_ID_LENGTH = 36 // length of a UUID string
         private const val MAX_SEEN_MESSAGE_IDS = 200
+        private const val MAX_SENDER_NAME_LENGTH = 40
         private const val VOICE_PREFIX = "#VOICE#"
         private const val VOICE_DIR_NAME = "voice"
         private const val PHOTO_PREFIX = "#PHOTO#"
@@ -643,6 +1028,19 @@ class ChatManager(
         private const val FILE_PREFIX = "#FILE#"
         private const val FILE_DIR_NAME = "files"
         private const val MAX_FILE_NAME_LENGTH = 128
+
+        /** How many members ("spokes") the host can have: a group is at
+         *  most the host plus [MAX_SPOKES] phones. */
+        private const val MAX_SPOKES = 5
+
+        /**
+         * Written in front of the host's advertised endpoint name. The
+         * character sorts after every normal letter or digit, so in the
+         * "smaller name requests" comparison a searching phone always
+         * requests the host, and the host stays the host. It is stripped
+         * again before any name is shown to the user.
+         */
+        private const val HUB_NAME_PREFIX = "\uFFFF"
 
         /**
          * Makes a file name safe to store: any folder parts are dropped

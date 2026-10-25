@@ -676,8 +676,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             .setCancelable(false)
             .setPositiveButton(R.string.accept) { _, _ -> accept() }
             .setNegativeButton(R.string.reject) { _, _ ->
+                // ChatManager reports the right status for our role
+                // (searching again, or still hosting the group).
                 reject()
-                setStatus(getString(R.string.status_searching), R.color.status_idle)
             }
             .show()
     }
@@ -691,6 +692,14 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         if (closing) return
         requestDialog?.dismiss()
         setStatus(getString(R.string.status_connected, endpointName), R.color.status_connected)
+    }
+
+    override fun onGroupHostUpdate(connectedCount: Int) {
+        if (closing) return
+        setStatus(
+            getString(R.string.status_hosting, connectedCount),
+            R.color.status_connected
+        )
     }
 
     override fun onDisconnected() {
@@ -707,12 +716,16 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         )
     }
 
-    override fun onMessageReceived(text: String) {
+    override fun onMessageReceived(text: String, senderName: String?) {
         if (closing) return
-        addMessage(ChatMessage(text = text, isSent = false))
+        addMessage(ChatMessage(text = text, isSent = false, senderName = senderName))
     }
 
-    override fun onVoiceMessageReceived(filePath: String, durationSeconds: Int) {
+    override fun onVoiceMessageReceived(
+        filePath: String,
+        durationSeconds: Int,
+        senderName: String?
+    ) {
         if (closing) return
         addMessage(
             ChatMessage(
@@ -720,19 +733,21 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 isSent = false,
                 type = ChatMessage.Type.VOICE,
                 audioPath = filePath,
-                durationSeconds = durationSeconds
+                durationSeconds = durationSeconds,
+                senderName = senderName
             )
         )
     }
 
-    override fun onPhotoMessageReceived(filePath: String) {
+    override fun onPhotoMessageReceived(filePath: String, senderName: String?) {
         if (closing) return
         addMessage(
             ChatMessage(
                 text = "",
                 isSent = false,
                 type = ChatMessage.Type.PHOTO,
-                imagePath = filePath
+                imagePath = filePath,
+                senderName = senderName
             )
         )
     }
@@ -740,7 +755,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     override fun onFileMessageReceived(
         filePath: String,
         fileName: String,
-        fileSizeBytes: Long
+        fileSizeBytes: Long,
+        senderName: String?
     ) {
         if (closing) return
         addMessage(
@@ -750,7 +766,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 type = ChatMessage.Type.FILE,
                 filePath = filePath,
                 fileName = fileName,
-                fileSizeBytes = fileSizeBytes
+                fileSizeBytes = fileSizeBytes,
+                senderName = senderName
             )
         )
     }

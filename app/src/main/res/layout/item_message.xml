@@ -17,6 +17,16 @@
         android:paddingEnd="14dp"
         android:paddingBottom="6dp">
 
+        <TextView
+            android:id="@+id/senderNameText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="2dp"
+            android:textColor="@color/accent"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
         <LinearLayout
             android:id="@+id/voiceRow"
             android:layout_width="wrap_content"
