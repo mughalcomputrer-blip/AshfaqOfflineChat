@@ -31,6 +31,13 @@
 <string name="photo_message">Photo message</string>
 <string name="not_connected_photo">Not connected. Photo not sent.</string>
 <string name="photo_failed">The photo could not be sent.</string>
+<string name="send_file">Send a file</string>
+<string name="file_message">File message</string>
+<string name="not_connected_file">Not connected. File not sent.</string>
+<string name="file_too_large">File is too large (maximum 100 MB).</string>
+<string name="file_failed">The file could not be sent.</string>
+<string name="no_app_for_file">No app found to open this file</string>
+<string name="file_gone">This file is no longer on this phone.</string>
 <string name="error_generic">Error: %1$s</string>
 <string name="error_hint">Make sure Bluetooth and Location are turned on, and that the other phone is also searching.</string>
 

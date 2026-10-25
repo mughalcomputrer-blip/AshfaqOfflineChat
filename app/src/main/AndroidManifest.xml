@@ -52,6 +52,18 @@
             </intent-filter>
         </activity>
 
+        <!-- Lets another app (e.g. a PDF viewer) open a file the user
+             taps in the chat. Shares one file at a time, only on tap. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
     </application>
 
 </manifest>

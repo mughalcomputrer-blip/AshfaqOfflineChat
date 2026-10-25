@@ -53,6 +53,48 @@
             android:maxWidth="220dp"
             android:visibility="gone" />
 
+        <LinearLayout
+            android:id="@+id/fileRow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:minWidth="180dp"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <ImageView
+                android:id="@+id/fileIcon"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:contentDescription="@string/file_message"
+                android:src="@android:drawable/ic_menu_agenda" />
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/fileNameText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:ellipsize="middle"
+                    android:maxLines="2"
+                    android:maxWidth="220dp"
+                    android:textColor="@color/bubble_received_text"
+                    android:textSize="15sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/fileSizeText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="13sp" />
+            </LinearLayout>
+        </LinearLayout>
+
         <TextView
             android:id="@+id/messageText"
             android:layout_width="wrap_content"

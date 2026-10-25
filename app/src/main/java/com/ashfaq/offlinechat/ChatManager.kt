@@ -49,6 +49,16 @@ class ChatManager(
 
         /** A photo arrived; [filePath] points to our own copy of it. */
         fun onPhotoMessageReceived(filePath: String) {}
+
+        /**
+         * A file arrived; [filePath] points to our own copy of it, saved
+         * under its original name ([fileName]), [fileSizeBytes] big.
+         */
+        fun onFileMessageReceived(
+            filePath: String,
+            fileName: String,
+            fileSizeBytes: Long
+        ) {}
     }
 
     private val appContext: Context = context.applicationContext
@@ -110,11 +120,16 @@ class ChatManager(
     // the small info message the sender sends just before the file.
     private var pendingVoiceDurationSeconds: Int? = null
 
-    // What kind of file is on its way (voice or photo), told to us by the
-    // small info message the sender sends just before every file. A file
-    // that arrives with no info is treated as voice, like before Phase 5.
-    private enum class IncomingFileKind { VOICE, PHOTO }
+    // What kind of file is on its way (voice, photo or a general file),
+    // told to us by the small info message the sender sends just before
+    // every file. A file that arrives with no info is treated as voice,
+    // like before Phase 5.
+    private enum class IncomingFileKind { VOICE, PHOTO, FILE }
     private var pendingFileKind: IncomingFileKind? = null
+
+    // Original name of the general file that is on its way, told to us by
+    // its info message. Only used when pendingFileKind is FILE.
+    private var pendingFileName: String? = null
 
     fun isConnected(): Boolean = connectedEndpointId != null
 
@@ -198,6 +213,29 @@ class ChatManager(
         return true
     }
 
+    /**
+     * Sends any file (a PDF, a document, ...). Same pattern as voice and
+     * photo: a file payload cannot carry any extra info, so we first send
+     * a tiny text info ("#FILE#" + the file's original name) and then the
+     * file itself. The file must already carry its final name, because
+     * that name is what the other phone saves and shows.
+     */
+    fun sendFileMessage(file: File): Boolean {
+        val endpointId = connectedEndpointId ?: return false
+        val info = FILE_PREFIX + file.name
+        client.sendPayload(endpointId, Payload.fromBytes(info.toByteArray(Charsets.UTF_8)))
+            .addOnFailureListener { e -> listener.onError(describe(e)) }
+        val filePayload = try {
+            Payload.fromFile(file)
+        } catch (e: Exception) {
+            listener.onError("The file could not be sent.")
+            return false
+        }
+        client.sendPayload(endpointId, filePayload)
+            .addOnFailureListener { e -> listener.onError(describe(e)) }
+        return true
+    }
+
     private fun stopEverything() {
         handler.removeCallbacks(reconnectRunnable)
         connectedEndpointId = null
@@ -205,6 +243,7 @@ class ChatManager(
         incomingFilePayloads.clear()
         pendingVoiceDurationSeconds = null
         pendingFileKind = null
+        pendingFileName = null
         client.stopAdvertising()
         client.stopDiscovery()
         client.stopAllEndpoints()
@@ -343,6 +382,7 @@ class ChatManager(
                         parseVoiceInfo(raw)?.let {
                             pendingVoiceDurationSeconds = it
                             pendingFileKind = IncomingFileKind.VOICE
+                            pendingFileName = null
                         }
                         return
                     }
@@ -350,6 +390,17 @@ class ChatManager(
                         // Info about the photo file that follows.
                         if (isPhotoInfo(raw)) {
                             pendingFileKind = IncomingFileKind.PHOTO
+                            pendingFileName = null
+                        }
+                        return
+                    }
+                    if (raw.startsWith(FILE_PREFIX)) {
+                        // Info about the general file that follows.
+                        val name = parseFileInfo(raw)
+                        if (name != null) {
+                            pendingFileKind = IncomingFileKind.FILE
+                            pendingFileName = name
+                            pendingVoiceDurationSeconds = null
                         }
                         return
                     }
@@ -372,6 +423,7 @@ class ChatManager(
                 incomingFilePayloads.remove(update.payloadId)
                 // The file is gone, so its info message is stale too.
                 pendingFileKind = null
+                pendingFileName = null
                 pendingVoiceDurationSeconds = null
                 listener.onError("A message could not be transferred.")
             } else if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
@@ -384,6 +436,7 @@ class ChatManager(
                     when (kind) {
                         IncomingFileKind.VOICE -> saveReceivedVoiceFile(filePayload)
                         IncomingFileKind.PHOTO -> saveReceivedPhotoFile(filePayload)
+                        IncomingFileKind.FILE -> saveReceivedFile(filePayload)
                     }
                 }
             }
@@ -410,6 +463,53 @@ class ChatManager(
     private fun isPhotoInfo(raw: String): Boolean {
         val name = raw.substring(PHOTO_PREFIX.length)
         return name.isNotEmpty() && name.endsWith(".jpg", ignoreCase = true)
+    }
+
+    /**
+     * Reads the file name out of a file info text ("#FILE#" + file name).
+     * The name is cleaned with [sanitizeFileName]; null when nothing sane
+     * is left, so a normal chat text that happens to start with the prefix
+     * is never mistaken for file info.
+     */
+    private fun parseFileInfo(raw: String): String? {
+        val name = sanitizeFileName(raw.substring(FILE_PREFIX.length))
+        return name.takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * Copies a fully received general file into our own storage, keeping
+     * its original name. When a file with that name is already there, a
+     * suffix like " (1)" is added, so an older file is never overwritten.
+     */
+    private fun saveReceivedFile(payload: Payload) {
+        val filePart = payload.asFile() ?: return
+        val fileDir = File(appContext.filesDir, FILE_DIR_NAME)
+        if (!fileDir.exists()) fileDir.mkdirs()
+        val wantedName = pendingFileName
+            ?: "file_${System.currentTimeMillis()}"
+        pendingFileName = null
+        val dest = uniqueFile(fileDir, wantedName)
+        if (!copyPayloadFile(filePart, dest) || !dest.exists() || dest.length() == 0L) {
+            dest.delete()
+            listener.onError("A file could not be saved.")
+            return
+        }
+        listener.onFileMessageReceived(dest.absolutePath, dest.name, dest.length())
+    }
+
+    /** Finds a free name in [dir]: the name itself, or "name (1)", ... */
+    private fun uniqueFile(dir: File, name: String): File {
+        var candidate = File(dir, name)
+        if (!candidate.exists()) return candidate
+        val dot = name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val extension = if (dot > 0) name.substring(dot) else ""
+        var counter = 1
+        while (candidate.exists()) {
+            candidate = File(dir, "$base ($counter)$extension")
+            counter++
+        }
+        return candidate
     }
 
     /** Copies a fully received photo into our own storage and shows it. */
@@ -540,6 +640,22 @@ class ChatManager(
         private const val VOICE_DIR_NAME = "voice"
         private const val PHOTO_PREFIX = "#PHOTO#"
         private const val PHOTO_DIR_NAME = "photos"
+        private const val FILE_PREFIX = "#FILE#"
+        private const val FILE_DIR_NAME = "files"
+        private const val MAX_FILE_NAME_LENGTH = 128
+
+        /**
+         * Makes a file name safe to store: any folder parts are dropped
+         * (both "/" and "\" count), control characters are removed, and
+         * the result is capped in length. "" when nothing usable remains.
+         */
+        fun sanitizeFileName(raw: String): String {
+            var name = raw.trim().replace('\\', '/').substringAfterLast('/')
+            name = name.filter { it >= ' ' }
+            name = name.trim().take(MAX_FILE_NAME_LENGTH).trim()
+            if (name == "." || name == "..") return ""
+            return name
+        }
         private const val PREFS_NAME = "offline_chat_prefs"
         private const val KEY_DISPLAY_NAME = "display_name"
     }

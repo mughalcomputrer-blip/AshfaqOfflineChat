@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Folders whose files may be handed to another app (for example a PDF
+  viewer) through FileProvider when the user taps a file message:
+  - the app's private folder: received files, voice messages, photos
+  - the cache folder: our own copies of files we sent
+  A file is only ever shared when the user taps it, one file at a time.
+-->
+<paths>
+    <files-path
+        name="app_files"
+        path="." />
+    <cache-path
+        name="app_cache"
+        path="." />
+</paths>

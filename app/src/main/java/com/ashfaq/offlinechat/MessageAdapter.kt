@@ -1,6 +1,8 @@
 package com.ashfaq.offlinechat
 
+import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaPlayer
@@ -8,13 +10,17 @@ import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.MimeTypeMap
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.recyclerview.widget.RecyclerView
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -37,6 +43,10 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val buttonPlay: ImageButton = view.findViewById(R.id.buttonPlay)
         val durationText: TextView = view.findViewById(R.id.durationText)
         val photoImage: ImageView = view.findViewById(R.id.photoImage)
+        val fileRow: View = view.findViewById(R.id.fileRow)
+        val fileIcon: ImageView = view.findViewById(R.id.fileIcon)
+        val fileNameText: TextView = view.findViewById(R.id.fileNameText)
+        val fileSizeText: TextView = view.findViewById(R.id.fileSizeText)
         val timeText: TextView = view.findViewById(R.id.timeText)
     }
 
@@ -69,6 +79,15 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.buttonPlay.setColorFilter(
                 ContextCompat.getColor(context, R.color.bubble_sent_text)
             )
+            holder.fileNameText.setTextColor(
+                ContextCompat.getColor(context, R.color.bubble_sent_text)
+            )
+            holder.fileSizeText.setTextColor(
+                ContextCompat.getColor(context, R.color.bubble_sent_text)
+            )
+            holder.fileIcon.setColorFilter(
+                ContextCompat.getColor(context, R.color.bubble_sent_text)
+            )
         } else {
             params.gravity = Gravity.START
             holder.bubble.setBackgroundResource(R.drawable.bg_bubble_received)
@@ -84,6 +103,15 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.buttonPlay.setColorFilter(
                 ContextCompat.getColor(context, R.color.accent)
             )
+            holder.fileNameText.setTextColor(
+                ContextCompat.getColor(context, R.color.bubble_received_text)
+            )
+            holder.fileSizeText.setTextColor(
+                ContextCompat.getColor(context, R.color.text_secondary)
+            )
+            holder.fileIcon.setColorFilter(
+                ContextCompat.getColor(context, R.color.accent)
+            )
         }
         holder.bubble.layoutParams = params
 
@@ -92,6 +120,8 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.messageText.visibility = View.GONE
                 holder.photoImage.visibility = View.GONE
                 holder.photoImage.setOnClickListener(null)
+                holder.fileRow.visibility = View.GONE
+                holder.bubble.setOnClickListener(null)
                 holder.voiceRow.visibility = View.VISIBLE
                 holder.durationText.text = formatDuration(message.durationSeconds)
                 val thisOnePlaying = playerPlaying && playingAudioPath == message.audioPath
@@ -108,6 +138,8 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.messageText.visibility = View.GONE
                 holder.voiceRow.visibility = View.GONE
                 holder.buttonPlay.setOnClickListener(null)
+                holder.fileRow.visibility = View.GONE
+                holder.bubble.setOnClickListener(null)
                 holder.photoImage.visibility = View.VISIBLE
                 val path = message.imagePath
                 val thumbnailPx = (220 * context.resources.displayMetrics.density).toInt()
@@ -119,12 +151,27 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                     if (path != null) showPhotoFullScreen(context, path)
                 }
             }
+            ChatMessage.Type.FILE -> {
+                holder.messageText.visibility = View.GONE
+                holder.voiceRow.visibility = View.GONE
+                holder.buttonPlay.setOnClickListener(null)
+                holder.photoImage.visibility = View.GONE
+                holder.photoImage.setOnClickListener(null)
+                holder.fileRow.visibility = View.VISIBLE
+                holder.fileNameText.text = message.fileName
+                    ?: message.filePath?.let { File(it).name }
+                    ?: ""
+                holder.fileSizeText.text = formatFileSize(message.fileSizeBytes)
+                holder.bubble.setOnClickListener { openFile(context, message) }
+            }
             ChatMessage.Type.TEXT -> {
                 holder.messageText.visibility = View.VISIBLE
                 holder.voiceRow.visibility = View.GONE
                 holder.photoImage.visibility = View.GONE
                 holder.photoImage.setOnClickListener(null)
                 holder.buttonPlay.setOnClickListener(null)
+                holder.fileRow.visibility = View.GONE
+                holder.bubble.setOnClickListener(null)
             }
         }
     }
@@ -294,5 +341,52 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             .setView(imageView)
             .setPositiveButton(android.R.string.ok) { dialog, _ -> dialog.dismiss() }
             .show()
+    }
+
+    // ---------- Files ----------
+
+    /** Writes a byte count the way people expect: B, KB or MB. */
+    private fun formatFileSize(bytes: Long): String = when {
+        bytes < 1024 -> "$bytes B"
+        bytes < 1024 * 1024 ->
+            String.format(Locale.getDefault(), "%.1f KB", bytes / 1024.0)
+        else ->
+            String.format(Locale.getDefault(), "%.1f MB", bytes / (1024.0 * 1024.0))
+    }
+
+    /**
+     * Opens a tapped file in another app (a PDF viewer, a gallery, ...)
+     * through FileProvider, so the other app gets read access to this one
+     * file only. A friendly Toast appears when that is not possible.
+     */
+    private fun openFile(context: Context, message: ChatMessage) {
+        val path = message.filePath
+        val file = path?.let { File(it) }
+        if (file == null || !file.exists()) {
+            Toast.makeText(context, R.string.file_gone, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = try {
+            FileProvider.getUriForFile(
+                context, context.packageName + ".fileprovider", file
+            )
+        } catch (e: Exception) {
+            Toast.makeText(context, R.string.file_gone, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val mimeType = MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(file.extension.lowercase(Locale.ROOT))
+            ?: "*/*"
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            context.startActivity(intent)
+        } catch (e: ActivityNotFoundException) {
+            Toast.makeText(context, R.string.no_app_for_file, Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(context, R.string.no_app_for_file, Toast.LENGTH_SHORT).show()
+        }
     }
 }

@@ -14,6 +14,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.OpenableColumns
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
@@ -38,6 +39,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private lateinit var editMessage: EditText
     private lateinit var buttonMic: ImageButton
     private lateinit var buttonPhoto: ImageButton
+    private lateinit var buttonFile: ImageButton
 
     private var requestDialog: AlertDialog? = null
     private var closing = false
@@ -80,6 +82,16 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
     }
 
+    // The system document picker, for files of any kind: again no storage
+    // permission is needed, and a cancelled pick stays silent.
+    private val filePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            prepareAndSendFile(uri)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Version 1 stays in portrait so a rotation cannot drop the connection.
@@ -91,6 +103,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         editMessage = findViewById(R.id.editMessage)
         buttonMic = findViewById(R.id.buttonMic)
         buttonPhoto = findViewById(R.id.buttonPhoto)
+        buttonFile = findViewById(R.id.buttonFile)
         val buttonFind: MaterialButton = findViewById(R.id.buttonFind)
         val buttonDisconnect: MaterialButton = findViewById(R.id.buttonDisconnect)
         val buttonSend: MaterialButton = findViewById(R.id.buttonSend)
@@ -115,6 +128,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonSend.setOnClickListener { sendCurrentMessage() }
         buttonMic.setOnClickListener { onMicClicked() }
         buttonPhoto.setOnClickListener { onPhotoClicked() }
+        buttonFile.setOnClickListener { onFileClicked() }
         buttonName.setOnClickListener { showNameDialog() }
         buttonClearChat.setOnClickListener { confirmClearChat() }
     }
@@ -428,6 +442,140 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         return inSampleSize
     }
 
+    // ---------- File messages ----------
+
+    private fun onFileClicked() {
+        if (!chatManager.isConnected()) {
+            Toast.makeText(this, R.string.not_connected_file, Toast.LENGTH_SHORT).show()
+            return
+        }
+        filePickerLauncher.launch(arrayOf("*/*"))
+    }
+
+    /**
+     * Copies the picked file into our cache folder (keeping its original
+     * name) and sends it. Files over [MAX_FILE_SIZE_BYTES] are refused
+     * with the normal error path, before anything is sent.
+     */
+    private fun prepareAndSendFile(uri: Uri) {
+        val originalName = queryDisplayName(uri)
+            ?: "file_${System.currentTimeMillis()}"
+        val cleanName = ChatManager.sanitizeFileName(originalName)
+            .ifEmpty { "file_${System.currentTimeMillis()}" }
+
+        // When the picker can tell us the size up front, refuse a file
+        // that is too large without copying it first.
+        val knownSize = queryFileSize(uri)
+        if (knownSize != null && knownSize > MAX_FILE_SIZE_BYTES) {
+            onError(getString(R.string.file_too_large))
+            return
+        }
+
+        val file = when (val result = copyPickedFile(uri, cleanName)) {
+            is CopyResult.Done -> result.file
+            CopyResult.TooLarge -> {
+                onError(getString(R.string.file_too_large))
+                return
+            }
+            CopyResult.Failed -> {
+                Toast.makeText(this, R.string.file_failed, Toast.LENGTH_SHORT).show()
+                return
+            }
+        }
+        if (!chatManager.sendFileMessage(file)) {
+            Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
+            return
+        }
+        addMessage(
+            ChatMessage(
+                text = "",
+                isSent = true,
+                type = ChatMessage.Type.FILE,
+                filePath = file.absolutePath,
+                fileName = file.name,
+                fileSizeBytes = file.length()
+            )
+        )
+    }
+
+    /** How copying a picked file into the cache folder went. */
+    private sealed class CopyResult {
+        class Done(val file: File) : CopyResult()
+        object TooLarge : CopyResult()
+        object Failed : CopyResult()
+    }
+
+    /**
+     * Streams the picked content into a cache file with the given name.
+     * The copy stops (and the half-written file is removed) as soon as
+     * the size passes [MAX_FILE_SIZE_BYTES], for pickers that do not
+     * report a size up front.
+     */
+    private fun copyPickedFile(uri: Uri, name: String): CopyResult {
+        val dest = File(cacheDir, name)
+        return try {
+            val input = contentResolver.openInputStream(uri) ?: return CopyResult.Failed
+            var total = 0L
+            var tooLarge = false
+            input.use { stream ->
+                dest.outputStream().use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val read = stream.read(buffer)
+                        if (read < 0) break
+                        total += read
+                        if (total > MAX_FILE_SIZE_BYTES) {
+                            tooLarge = true
+                            break
+                        }
+                        output.write(buffer, 0, read)
+                    }
+                }
+            }
+            when {
+                tooLarge -> {
+                    dest.delete()
+                    CopyResult.TooLarge
+                }
+                !dest.exists() || dest.length() == 0L -> {
+                    dest.delete()
+                    CopyResult.Failed
+                }
+                else -> CopyResult.Done(dest)
+            }
+        } catch (e: Exception) {
+            dest.delete()
+            CopyResult.Failed
+        }
+    }
+
+    /** The name the picker shows for this file. Null when unknown. */
+    private fun queryDisplayName(uri: Uri): String? =
+        queryOpenableColumn(uri, OpenableColumns.DISPLAY_NAME) { cursor, index ->
+            cursor.getString(index)
+        }
+
+    /** The size the picker reports for this file. Null when unknown. */
+    private fun queryFileSize(uri: Uri): Long? =
+        queryOpenableColumn(uri, OpenableColumns.SIZE) { cursor, index ->
+            if (cursor.isNull(index)) null else cursor.getLong(index)
+        }
+
+    private fun <T> queryOpenableColumn(
+        uri: Uri,
+        column: String,
+        read: (android.database.Cursor, Int) -> T?
+    ): T? {
+        return try {
+            contentResolver.query(uri, arrayOf(column), null, null, null)?.use { cursor ->
+                val index = cursor.getColumnIndex(column)
+                if (index >= 0 && cursor.moveToFirst()) read(cursor, index) else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     // ---------- Permissions ----------
 
     private fun requiredPermissions(): Array<String> {
@@ -589,6 +737,24 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         )
     }
 
+    override fun onFileMessageReceived(
+        filePath: String,
+        fileName: String,
+        fileSizeBytes: Long
+    ) {
+        if (closing) return
+        addMessage(
+            ChatMessage(
+                text = "",
+                isSent = false,
+                type = ChatMessage.Type.FILE,
+                filePath = filePath,
+                fileName = fileName,
+                fileSizeBytes = fileSizeBytes
+            )
+        )
+    }
+
     override fun onError(message: String) {
         if (closing) return
         requestDialog?.dismiss()
@@ -601,5 +767,6 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         private const val MAX_RECORDING_SECONDS = 120
         private const val MAX_PHOTO_DIMENSION = 1600 // pixels, longest side
         private const val PHOTO_JPEG_QUALITY = 80
+        private const val MAX_FILE_SIZE_BYTES = 100L * 1024 * 1024 // 100 MB
     }
 }
