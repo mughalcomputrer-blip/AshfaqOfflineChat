@@ -28,49 +28,12 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
             android:text="@string/app_name"
             android:textColor="@color/on_primary"
             android:textSize="20sp"
             android:textStyle="bold" />
-
-        <TextView
-            android:id="@+id/buttonName"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:clickable="true"
-            android:focusable="true"
-            android:padding="8dp"
-            android:text="@string/your_name"
-            android:textColor="@color/on_primary"
-            android:textSize="15sp"
-            android:textStyle="bold" />
-
-        <TextView
-            android:id="@+id/buttonClearChat"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:clickable="true"
-            android:focusable="true"
-            android:padding="8dp"
-            android:text="@string/clear_chat"
-            android:textColor="@color/on_primary"
-            android:textSize="15sp"
-            android:textStyle="bold" />
-
-        <TextView
-            android:id="@+id/buttonTheme"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:clickable="true"
-            android:contentDescription="@string/theme_toggle"
-            android:focusable="true"
-            android:padding="8dp"
-            android:text="🌙"
-            android:textColor="@color/on_primary"
-            android:textSize="15sp" />
 
         <TextView
             android:id="@+id/buttonSearch"
@@ -85,42 +48,20 @@
             android:textColor="@color/on_primary"
             android:textSize="15sp" />
 
+        <!-- Everything that used to sit in this row as its own
+             button (Name, Clear, dark mode, PIN lock, Friends, color
+             themes) now lives in this overflow menu, WhatsApp style,
+             so the title has room to breathe. -->
         <TextView
-            android:id="@+id/buttonLock"
+            android:id="@+id/buttonOverflow"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:clickable="true"
-            android:contentDescription="@string/pin_lock"
+            android:contentDescription="@string/more_options"
             android:focusable="true"
             android:padding="8dp"
-            android:text="🔒"
-            android:textColor="@color/on_primary"
-            android:textSize="15sp" />
-
-        <TextView
-            android:id="@+id/buttonFriends"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:clickable="true"
-            android:contentDescription="@string/friends"
-            android:focusable="true"
-            android:padding="8dp"
-            android:text="👥"
-            android:textColor="@color/on_primary"
-            android:textSize="15sp" />
-
-        <TextView
-            android:id="@+id/buttonThemes"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:clickable="true"
-            android:contentDescription="@string/color_themes"
-            android:focusable="true"
-            android:padding="8dp"
-            android:text="🎨"
+            android:text="⋮"
             android:textColor="@color/on_primary"
             android:textSize="15sp" />
     </LinearLayout>
@@ -297,33 +238,16 @@
             android:textColor="@color/text_primary"
             android:textColorHint="@color/text_secondary" />
 
-        <ImageButton
-            android:id="@+id/buttonLocation"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_marginStart="4dp"
-            android:background="@android:color/transparent"
-            android:contentDescription="@string/share_location"
-            android:src="@android:drawable/ic_menu_mylocation"
-            android:tint="@color/primary" />
-
-        <ImageButton
-            android:id="@+id/buttonPhoto"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_marginStart="4dp"
-            android:background="@android:color/transparent"
-            android:contentDescription="@string/pick_media"
-            android:src="@android:drawable/ic_menu_gallery"
-            android:tint="@color/primary" />
-
+        <!-- The one attach button: it opens a small menu (photo or
+             video / file / location), WhatsApp style, instead of
+             three separate buttons crowding the text field. -->
         <ImageButton
             android:id="@+id/buttonFile"
             android:layout_width="48dp"
             android:layout_height="48dp"
             android:layout_marginStart="4dp"
             android:background="@android:color/transparent"
-            android:contentDescription="@string/send_file"
+            android:contentDescription="@string/attach"
             android:src="@android:drawable/ic_menu_add"
             android:tint="@color/primary" />
 

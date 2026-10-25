@@ -33,6 +33,7 @@ import android.webkit.MimeTypeMap
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
@@ -57,26 +58,19 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private lateinit var recyclerMessages: RecyclerView
     private lateinit var editMessage: EditText
     private lateinit var buttonMic: ImageButton
-    private lateinit var buttonPhoto: ImageButton
     private lateinit var buttonFile: ImageButton
-    private lateinit var buttonLocation: ImageButton
     private lateinit var quoteBar: View
     private lateinit var quoteBarSender: TextView
     private lateinit var quoteBarText: TextView
     private lateinit var buttonSearch: TextView
+    private lateinit var buttonOverflow: TextView
     private lateinit var searchBar: View
     private lateinit var editSearch: EditText
     private lateinit var buttonCloseSearch: ImageButton
     private lateinit var buttonFind: MaterialButton
     private lateinit var buttonDisconnect: MaterialButton
     private lateinit var buttonSend: MaterialButton
-    private lateinit var buttonName: TextView
-    private lateinit var buttonClearChat: TextView
-    private lateinit var buttonTheme: TextView
     private lateinit var buttonCancelQuote: ImageButton
-    private lateinit var buttonLock: TextView
-    private lateinit var buttonFriends: TextView
-    private lateinit var buttonThemes: TextView
     private lateinit var lockOverlay: View
     private lateinit var lockTitle: TextView
     private lateinit var lockHint: TextView
@@ -197,26 +191,19 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         recyclerMessages = findViewById(R.id.recyclerMessages)
         editMessage = findViewById(R.id.editMessage)
         buttonMic = findViewById(R.id.buttonMic)
-        buttonPhoto = findViewById(R.id.buttonPhoto)
         buttonFile = findViewById(R.id.buttonFile)
-        buttonLocation = findViewById(R.id.buttonLocation)
         quoteBar = findViewById(R.id.quoteBar)
         quoteBarSender = findViewById(R.id.quoteBarSender)
         quoteBarText = findViewById(R.id.quoteBarText)
         buttonSearch = findViewById(R.id.buttonSearch)
+        buttonOverflow = findViewById(R.id.buttonOverflow)
         searchBar = findViewById(R.id.searchBar)
         editSearch = findViewById(R.id.editSearch)
         buttonCloseSearch = findViewById(R.id.buttonCloseSearch)
         buttonFind = findViewById(R.id.buttonFind)
         buttonDisconnect = findViewById(R.id.buttonDisconnect)
         buttonSend = findViewById(R.id.buttonSend)
-        buttonName = findViewById(R.id.buttonName)
-        buttonClearChat = findViewById(R.id.buttonClearChat)
-        buttonTheme = findViewById(R.id.buttonTheme)
         buttonCancelQuote = findViewById(R.id.buttonCancelQuote)
-        buttonLock = findViewById(R.id.buttonLock)
-        buttonFriends = findViewById(R.id.buttonFriends)
-        buttonThemes = findViewById(R.id.buttonThemes)
         lockOverlay = findViewById(R.id.lockOverlay)
         lockTitle = findViewById(R.id.lockTitle)
         lockHint = findViewById(R.id.lockHint)
@@ -228,13 +215,6 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         // the lock screen is the first thing seen, and it must already
         // wear the right palette before anything else happens.
         applyThemeColors()
-
-        // These three buttons never touch the chat machinery, so
-        // they can be wired ahead of the PIN gate — though the gate's
-        // overlay keeps them unreachable until the app is unlocked.
-        buttonTheme.setOnClickListener { toggleDarkMode() }
-        buttonLock.setOnClickListener { showPinLockMenu() }
-        buttonThemes.setOnClickListener { showThemesDialog() }
 
         // The PIN gate. While the lock screen is up, none of the
         // normal startup runs: no chat manager, no saved chat on
@@ -294,14 +274,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonDisconnect.setOnClickListener { chatManager.disconnect() }
         buttonSend.setOnClickListener { sendCurrentMessage() }
         buttonMic.setOnClickListener { onMicClicked() }
-        buttonPhoto.setOnClickListener { onPhotoClicked() }
-        buttonFile.setOnClickListener { onFileClicked() }
-        buttonLocation.setOnClickListener { onLocationClicked() }
-        buttonFriends.setOnClickListener { showFriendsDialog() }
-        buttonName.setOnClickListener { showNameDialog() }
-        buttonClearChat.setOnClickListener { confirmClearChat() }
+        buttonFile.setOnClickListener { showAttachMenu(it) }
         buttonCancelQuote.setOnClickListener { clearPendingQuote() }
         buttonSearch.setOnClickListener { toggleSearchBar() }
+        buttonOverflow.setOnClickListener { showOverflowMenu(it) }
         buttonCloseSearch.setOnClickListener { closeSearch() }
         editSearch.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(
@@ -339,6 +315,66 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
     }
 
+    /**
+     * The ⋮ button in the header: a WhatsApp-style overflow menu.
+     * Everything that once crowded the header as its own button —
+     * Name, Friends, dark mode, PIN lock, color themes, Clear chat —
+     * lives here now, each item calling the very same handler or
+     * dialog its old button called.
+     */
+    private fun showOverflowMenu(anchor: View) {
+        val itemName = 1
+        val itemFriends = 2
+        val itemDarkMode = 3
+        val itemPinLock = 4
+        val itemThemes = 5
+        val itemClear = 6
+        val popup = PopupMenu(this, anchor)
+        popup.menu.add(0, itemName, 0, R.string.your_name)
+        popup.menu.add(0, itemFriends, 1, R.string.friends)
+        popup.menu.add(0, itemDarkMode, 2, R.string.dark_mode)
+        popup.menu.add(0, itemPinLock, 3, R.string.pin_lock_title)
+        popup.menu.add(0, itemThemes, 4, R.string.color_themes)
+        popup.menu.add(0, itemClear, 5, R.string.clear_chat)
+        popup.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                itemName -> showNameDialog()
+                itemFriends -> showFriendsDialog()
+                itemDarkMode -> toggleDarkMode()
+                itemPinLock -> showPinLockMenu()
+                itemThemes -> showThemesDialog()
+                itemClear -> confirmClearChat()
+            }
+            true
+        }
+        popup.show()
+    }
+
+    /**
+     * The ➕ attach button in the input row: a WhatsApp-style menu of
+     * the three things that can be attached — a photo or video, a
+     * file, or the current location — each calling the same flow its
+     * own button used to call before the row was decluttered.
+     */
+    private fun showAttachMenu(anchor: View) {
+        val itemMedia = 1
+        val itemFile = 2
+        val itemLocation = 3
+        val popup = PopupMenu(this, anchor)
+        popup.menu.add(0, itemMedia, 0, R.string.pick_media)
+        popup.menu.add(0, itemFile, 1, R.string.send_file)
+        popup.menu.add(0, itemLocation, 2, R.string.share_location)
+        popup.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                itemMedia -> onPhotoClicked()
+                itemFile -> onFileClicked()
+                itemLocation -> onLocationClicked()
+            }
+            true
+        }
+        popup.show()
+    }
+
     /** Flips the dark-mode switch and rebuilds the screen in the new palette. */
     private fun toggleDarkMode() {
         AppColors.setDark(this, !AppColors.isDark(this))
@@ -346,7 +382,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     }
 
     /**
-     * The 🎨 header button: a single-choice list of the color themes
+     * The Color themes overflow-menu item: a single-choice list of the color themes
      * (update #12), the current one checked. Picking one saves it and
      * rebuilds the screen in the new skin, exactly like the dark-mode
      * toggle does. A standard dialog, so it keeps the light dialog
@@ -385,12 +421,6 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             .setBackgroundColor(AppColors.headerBackground(this))
         findViewById<TextView>(R.id.titleText)
             .setTextColor(AppColors.headerText(this))
-        findViewById<TextView>(R.id.buttonName)
-            .setTextColor(AppColors.headerText(this))
-        findViewById<TextView>(R.id.buttonClearChat)
-            .setTextColor(AppColors.headerText(this))
-        buttonTheme.setTextColor(AppColors.headerText(this))
-        buttonTheme.text = if (dark) "☀️" else "🌙"
         window.statusBarColor = AppColors.statusBar(this)
         statusText.setTextColor(AppColors.statusColor(this, R.color.status_idle))
 
@@ -407,15 +437,11 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         editMessage.setBackgroundResource(AppColors.inputFieldDrawable(this))
         editMessage.setTextColor(AppColors.textPrimary(this))
         editMessage.setHintTextColor(AppColors.textSecondary(this))
-        buttonPhoto.setColorFilter(AppColors.iconTint(this))
         buttonFile.setColorFilter(AppColors.iconTint(this))
         buttonMic.setColorFilter(AppColors.iconTint(this))
-        buttonLocation.setColorFilter(AppColors.iconTint(this))
 
         buttonSearch.setTextColor(AppColors.headerText(this))
-        buttonLock.setTextColor(AppColors.headerText(this))
-        buttonFriends.setTextColor(AppColors.headerText(this))
-        buttonThemes.setTextColor(AppColors.headerText(this))
+        buttonOverflow.setTextColor(AppColors.headerText(this))
         searchBar.setBackgroundColor(AppColors.inputBarBackground(this))
         editSearch.setBackgroundResource(AppColors.inputFieldDrawable(this))
         editSearch.setTextColor(AppColors.textPrimary(this))
@@ -490,7 +516,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     // ---------- Friends ----------
 
     /**
-     * The 👥 header button: the people this phone has connected with
+     * The Friends overflow-menu item: the people this phone has connected with
      * before, newest first, each with the last time they connected.
      * Tapping one looks for that person and asks them to connect
      * (see [onFriendClicked]). Nobody remembered yet gets a short
@@ -1268,7 +1294,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     // ---------- Location messages ----------
 
     /**
-     * The 📍 button: shares this phone's current position. Without the
+     * The Location attach-menu item: shares this phone's current position. Without the
      * location permission there is nothing to share, so it is asked
      * for first and the tap ends there (after granting, the user taps
      * again). The position comes from the framework LocationManager —
@@ -1546,7 +1572,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     // ---------- PIN lock ----------
 
     /**
-     * The 🔒 header button. With no PIN set it goes straight to the
+     * The PIN lock overflow-menu item. With no PIN set it goes straight to the
      * set flow; with one set it offers Change or Remove, and both of
      * those first ask for the current PIN. This only ever runs while
      * the app is unlocked — at the lock screen the header sits under
