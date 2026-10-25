@@ -1,7 +1,12 @@
 package com.ashfaq.offlinechat
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.AudioTrack
 import android.media.MediaMetadataRetriever
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -20,6 +25,8 @@ import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
 import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.Locale
 import java.util.UUID
 
@@ -74,6 +81,20 @@ import java.util.UUID
  * user picked this exact person. Other phones found meanwhile are
  * left alone (a normal search would have asked one of them). The
  * search gives up after a while and reports [Listener.onFriendNotFound].
+ *
+ * Walkie-talkie: a live push-to-talk voice (see [startTalk]). A tiny
+ * "#TALK#START" text goes out first through the ordinary text path —
+ * so it carries the talker's name and the hub relays it to the whole
+ * group like any text — and "#TALK#END" follows when the talk stops.
+ * The audio itself rides a STREAM payload: the microphone is copied
+ * into a pipe whose other end Nearby sends (one pipe per target,
+ * because a stream payload belongs to one pipe). On this side a pump
+ * thread plays the incoming stream through an AudioTrack; when this
+ * phone is the hub, the pump also copies every chunk into pipes
+ * whose streams go to the other members, so the whole group hears
+ * the talk. It is half-duplex, like a real walkie-talkie: a stream
+ * that arrives while we are talking ourselves, or while another
+ * talk is already playing, is drained and dropped, never mixed in.
  */
 class ChatManager(
     context: Context,
@@ -142,6 +163,31 @@ class ChatManager(
             emoji: String,
             reactorName: String?
         ) {}
+
+        /**
+         * A walkie-talkie talk started: the person named
+         * [senderName] (null when the name is unknown) is holding
+         * their talk button, and their voice is playing — or about
+         * to play — on this phone. Reported once per talk, from the
+         * "#TALK#START" text that precedes the audio stream (or from
+         * the stream itself, when no such text was seen for it).
+         */
+        fun onTalkStarted(senderName: String?) {}
+
+        /**
+         * The current walkie-talkie talk ended and the channel is
+         * free again. Reported once per talk.
+         */
+        fun onTalkEnded() {}
+
+        /**
+         * Our own walkie-talkie talk ended by itself — the time cap
+         * was reached, every pipe died, or the microphone failed —
+         * rather than through [stopTalk]. The screen uses this to
+         * reset its talk button while the user may still be holding
+         * it down.
+         */
+        fun onOwnTalkEnded() {}
 
         fun onError(message: String)
 
@@ -382,6 +428,45 @@ class ChatManager(
     // (an older app version) simply has no id here.
     private val pendingWireIds = mutableMapOf<String, String>()
 
+    // ----- Walkie-talkie state (see the class comment) -----
+
+    /** Guards the two pipe lists below: the capture and pump threads
+     *  write to them while the main thread opens and closes them. */
+    private val talkLock = Object()
+
+    /** True while our own talk button is held and we are sending. */
+    @Volatile
+    private var talkCapturing = false
+    private var talkCaptureThread: Thread? = null
+
+    /** The pipes our microphone is copied into: endpoint id -> the
+     *  writable end of that target's stream pipe. */
+    private val talkOutStreams = mutableListOf<Pair<String, OutputStream>>()
+
+    /** The talk currently playing on this phone, if any. */
+    @Volatile
+    private var incomingTalk: IncomingTalk? = null
+
+    /** The writable ends of the pipes carrying the current incoming
+     *  talk on to the other members (hub only; empty for a member). */
+    private val talkRelayStreams = mutableListOf<OutputStream>()
+
+    /** The announced current talker, from their "#TALK#START" text:
+     *  the endpoint that text came from (the hub's, for a relayed
+     *  talk) and the talker's display name. Both are null while the
+     *  channel is free. The name is also what an incoming stream is
+     *  paired with, because the stream itself carries no name. */
+    private var peerTalkEndpointId: String? = null
+    private var peerTalkName: String? = null
+
+    /** One incoming talk being played: where its stream came from,
+     *  the stream itself, and who is talking (when known). */
+    private class IncomingTalk(
+        val endpointId: String,
+        val input: InputStream,
+        val name: String?
+    )
+
     fun isConnected(): Boolean = connectedEndpoints.isNotEmpty()
 
     /**
@@ -568,6 +653,505 @@ class ChatManager(
     fun sendReaction(targetWireId: String, emoji: String): Boolean {
         if (targetWireId.isEmpty() || emoji !in REACTION_EMOJIS) return false
         return sendMessage(REACT_PREFIX + targetWireId + "#" + emoji)
+    }
+
+    // ----- Walkie-talkie (live push-to-talk voice) -----
+
+    /** True while someone else's talk is on the channel: announced by
+     *  their "#TALK#START" text, or already playing here. */
+    fun isChannelBusy(): Boolean =
+        incomingTalk != null || peerTalkEndpointId != null
+
+    /** The announced current talker's name, or null when the
+     *  channel is free (or the talker's name is unknown). */
+    fun currentTalkerName(): String? = peerTalkName
+
+    /**
+     * Starts a live talk to everyone we are connected with (see the
+     * class comment). The "#TALK#START" text goes first, then one
+     * stream payload per target, then the microphone starts copying
+     * into every target's pipe on its own thread.
+     *
+     * Returns false — and sends nothing — when there is no
+     * connection, when the channel is busy (a talk is playing or
+     * announced), when a previous talk is still winding down, or
+     * when the microphone cannot be had (busy, or no permission).
+     */
+    fun startTalk(): Boolean {
+        if (talkCapturing) return false
+        if (talkCaptureThread?.isAlive == true) return false
+        if (isChannelBusy()) return false
+        val targets = sendTargets()
+        if (targets.isEmpty()) return false
+
+        // The microphone first: a talk that cannot record must not
+        // even announce itself.
+        val minBuffer = AudioRecord.getMinBufferSize(
+            TALK_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        val recorder = try {
+            AudioRecord.Builder()
+                .setAudioSource(MediaRecorder.AudioSource.MIC)
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(TALK_SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setBufferSizeInBytes(maxOf(minBuffer, TALK_CHUNK_BYTES * 2))
+                .build()
+        } catch (e: Exception) {
+            null
+        }
+        if (recorder == null || recorder.state != AudioRecord.STATE_INITIALIZED) {
+            try {
+                recorder?.release()
+            } catch (ignored: Exception) {
+                // Nothing to release then.
+            }
+            return false
+        }
+
+        // Announce, then open one stream pipe per target: a stream
+        // payload carries one pipe, so every phone gets its own.
+        sendMessage(TALK_START_TEXT)
+        val outs = mutableListOf<Pair<String, OutputStream>>()
+        for (target in targets) {
+            try {
+                val pipe = ParcelFileDescriptor.createPipe()
+                client.sendPayload(target, Payload.fromStream(pipe[0]))
+                    .addOnFailureListener {
+                        // A target that cannot take the stream is
+                        // dropped when its pipe fails on write.
+                    }
+                outs.add(
+                    target to ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])
+                )
+            } catch (e: Exception) {
+                // This target simply does not hear the talk.
+            }
+        }
+        if (outs.isEmpty()) {
+            try {
+                recorder.release()
+            } catch (ignored: Exception) {
+                // Recorder already gone.
+            }
+            sendMessage(TALK_END_TEXT)
+            return false
+        }
+        synchronized(talkLock) {
+            talkOutStreams.clear()
+            talkOutStreams.addAll(outs)
+        }
+        talkCapturing = true
+        talkCaptureThread = Thread { runTalkCapture(recorder) }.apply {
+            name = "walkie-talk-capture"
+            isDaemon = true
+            start()
+        }
+        return true
+    }
+
+    /**
+     * Ends our own talk (the talk button was released). Closing the
+     * pipes is what ends the stream on the other phones — they read
+     * to the end of it and stop — so it happens at once; the capture
+     * thread notices the cleared flag and releases the microphone on
+     * its own. The "#TALK#END" text follows, for any phone whose
+     * stream never arrived.
+     */
+    fun stopTalk() {
+        if (!talkCapturing && talkCaptureThread?.isAlive != true) return
+        talkCapturing = false
+        closeTalkOutStreams()
+        sendMessage(TALK_END_TEXT)
+    }
+
+    /**
+     * The capture thread: copies the microphone into every target's
+     * pipe, chunk by chunk, until [stopTalk] clears the flag, the
+     * time cap is reached, or every pipe has died. A natural end
+     * (anything but [stopTalk], which clears the flag first) sends
+     * the closing text and reports [Listener.onOwnTalkEnded].
+     */
+    private fun runTalkCapture(recorder: AudioRecord) {
+        val buffer = ByteArray(TALK_CHUNK_BYTES)
+        val startNanos = System.nanoTime()
+        try {
+            recorder.startRecording()
+            while (talkCapturing) {
+                if (System.nanoTime() - startNanos > TALK_MAX_NANOS) break
+                val read = try {
+                    recorder.read(buffer, 0, buffer.size)
+                } catch (e: Exception) {
+                    break
+                }
+                if (read < 0) break
+                if (read == 0) continue
+                val chunk = buffer.copyOf(read)
+                // Write outside the lock (on a snapshot): a pipe
+                // write can block while its stream is stalled, and
+                // stopTalk() — on the main thread — must never wait
+                // behind one.
+                val snapshot = synchronized(talkLock) {
+                    talkOutStreams.map { it.second }
+                }
+                val dead = mutableListOf<OutputStream>()
+                for (out in snapshot) {
+                    try {
+                        out.write(chunk)
+                        out.flush()
+                    } catch (e: Exception) {
+                        dead.add(out)
+                    }
+                }
+                if (dead.isNotEmpty()) {
+                    synchronized(talkLock) {
+                        talkOutStreams.removeAll { it.second in dead }
+                    }
+                    dead.forEach { closeQuietly(it) }
+                }
+                val anyLeft = synchronized(talkLock) { talkOutStreams.isNotEmpty() }
+                if (!anyLeft) break
+            }
+        } catch (e: Exception) {
+            // Microphone trouble ends the talk like a release does.
+        } finally {
+            try {
+                recorder.stop()
+            } catch (ignored: Exception) {
+                // Recorder was never started, or already stopped.
+            }
+            try {
+                recorder.release()
+            } catch (ignored: Exception) {
+                // Recorder already gone.
+            }
+            val endedOnItsOwn = talkCapturing
+            talkCapturing = false
+            closeTalkOutStreams()
+            if (endedOnItsOwn) {
+                sendMessage(TALK_END_TEXT)
+                handler.post { listener.onOwnTalkEnded() }
+            }
+        }
+    }
+
+    /** Closes every outgoing talk pipe (see [stopTalk]). */
+    private fun closeTalkOutStreams() {
+        val outs: List<OutputStream>
+        synchronized(talkLock) {
+            outs = talkOutStreams.map { it.second }
+            talkOutStreams.clear()
+        }
+        outs.forEach { closeQuietly(it) }
+    }
+
+    /** Closes one target's outgoing talk pipe (it left the group). */
+    private fun closeTalkOutStream(endpointId: String) {
+        var out: OutputStream? = null
+        synchronized(talkLock) {
+            val iterator = talkOutStreams.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.first == endpointId) {
+                    out = entry.second
+                    iterator.remove()
+                }
+            }
+        }
+        out?.let { closeQuietly(it) }
+    }
+
+    /**
+     * Stops our own talk without the closing text (the connection
+     * itself is going away, so nobody is listening any more). The
+     * capture thread winds down on its own; see [runTalkCapture].
+     */
+    private fun stopTalkInternal() {
+        talkCapturing = false
+        closeTalkOutStreams()
+    }
+
+    private fun closeQuietly(out: OutputStream) {
+        try {
+            out.close()
+        } catch (ignored: Exception) {
+            // Already closed, or broken: nothing more to do.
+        }
+    }
+
+    /**
+     * A "#TALK#START" text arrived: a talk is announced. The first
+     * announcer holds the channel; a second one (two people pressed
+     * at once) changes nothing here — its stream is drained when it
+     * arrives, and its "#TALK#END" will not clear the first talk.
+     */
+    private fun onTalkControlStart(endpointId: String, senderName: String?) {
+        if (peerTalkEndpointId != null) return
+        peerTalkEndpointId = endpointId
+        peerTalkName = senderName
+        listener.onTalkStarted(senderName)
+    }
+
+    /**
+     * A "#TALK#END" text arrived. When it belongs to the talk that
+     * is playing, the stream is cut short (the pump's clean-up then
+     * ends the announced talk as it unwinds); when the stream never
+     * played here (it was drained, or never came), the announced
+     * talk simply ends. Another phone's end text changes nothing.
+     */
+    private fun onTalkControlEnd(endpointId: String) {
+        if (peerTalkEndpointId != endpointId) return
+        val session = incomingTalk
+        if (session != null && session.endpointId == endpointId) {
+            try {
+                session.input.close()
+            } catch (ignored: Exception) {
+                // The pump notices either way.
+            }
+        } else {
+            peerTalkEndpointId = null
+            peerTalkName = null
+            listener.onTalkEnded()
+        }
+    }
+
+    /**
+     * A stream payload arrived: someone is talking to us (or, on
+     * the hub, a member is talking and the group must hear it too).
+     * While we are talking ourselves, or while another talk is
+     * already playing, the stream is drained and dropped instead —
+     * half-duplex, and draining keeps the sender's transfer
+     * finishing cleanly.
+     */
+    private fun onTalkStreamReceived(endpointId: String, payload: Payload) {
+        val input = try {
+            payload.asStream()?.asInputStream()
+        } catch (e: Exception) {
+            null
+        } ?: return
+        if (talkCapturing || incomingTalk != null) {
+            drainTalkStream(input)
+            return
+        }
+        val name = peerTalkName
+            ?: connectedEndpoints[endpointId]
+                ?.let { baseNameOf(it) }
+                ?.takeIf { it.isNotEmpty() }
+        val session = IncomingTalk(endpointId, input, name)
+        incomingTalk = session
+        if (peerTalkEndpointId == null) {
+            // No "#TALK#START" was seen for this talk (it may have
+            // raced the stream): announce it from the stream itself.
+            peerTalkEndpointId = endpointId
+            peerTalkName = name
+            listener.onTalkStarted(name)
+        }
+        if (role == Role.HUB) {
+            openTalkRelays(endpointId)
+        }
+        Thread { runTalkPump(session) }.apply {
+            name = "walkie-talk-pump"
+            isDaemon = true
+            start()
+        }
+    }
+
+    /** Opens the hub's onward streams for a talk that just started:
+     *  one fresh pipe per other member, fed by the pump. */
+    private fun openTalkRelays(exceptEndpointId: String) {
+        val relays = mutableListOf<OutputStream>()
+        for (target in sendTargets(exclude = exceptEndpointId)) {
+            try {
+                val pipe = ParcelFileDescriptor.createPipe()
+                client.sendPayload(target, Payload.fromStream(pipe[0]))
+                    .addOnFailureListener {
+                        // A member that cannot take the stream is
+                        // dropped when its pipe fails on write.
+                    }
+                relays.add(ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]))
+            } catch (e: Exception) {
+                // This member simply does not hear the talk.
+            }
+        }
+        synchronized(talkLock) {
+            talkRelayStreams.clear()
+            talkRelayStreams.addAll(relays)
+        }
+    }
+
+    /** Closes the hub's onward pipes: their streams end, so the
+     *  members' playback stops, exactly as the talker's own did. */
+    private fun closeTalkRelays() {
+        val outs: List<OutputStream>
+        synchronized(talkLock) {
+            outs = talkRelayStreams.toList()
+            talkRelayStreams.clear()
+        }
+        outs.forEach { closeQuietly(it) }
+    }
+
+    /** Copies one chunk of the playing talk into every relay pipe;
+     *  a pipe that fails is dropped and closed. Like the capture
+     *  loop, the writes happen outside the lock, on a snapshot. */
+    private fun relayTalkChunk(buffer: ByteArray, length: Int) {
+        val chunk = buffer.copyOf(length)
+        val snapshot = synchronized(talkLock) { talkRelayStreams.toList() }
+        val dead = mutableListOf<OutputStream>()
+        for (out in snapshot) {
+            try {
+                out.write(chunk)
+                out.flush()
+            } catch (e: Exception) {
+                dead.add(out)
+            }
+        }
+        if (dead.isNotEmpty()) {
+            synchronized(talkLock) { talkRelayStreams.removeAll(dead) }
+            dead.forEach { closeQuietly(it) }
+        }
+    }
+
+    /**
+     * The pump thread of an incoming talk: reads the stream chunk
+     * by chunk, plays each chunk through the speaker, and (on the
+     * hub) copies it into the relay pipes. Reading is what paces
+     * playback, so the voice is heard in near-real time. When the
+     * stream ends — the talker let go, or the stream was cut by a
+     * "#TALK#END" or a disconnect — the player is released, the
+     * relay pipes are closed (ending the members' streams), and the
+     * announced talk is ended.
+     */
+    private fun runTalkPump(session: IncomingTalk) {
+        val minBuffer = AudioTrack.getMinBufferSize(
+            TALK_SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        val track = try {
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(TALK_SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setBufferSizeInBytes(maxOf(minBuffer, TALK_CHUNK_BYTES * 2))
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        } catch (e: Exception) {
+            null // No player: the stream is still drained (and relayed).
+        }
+        try {
+            try {
+                track?.play()
+            } catch (ignored: Exception) {
+                // A player that will not start just stays silent.
+            }
+            val buffer = ByteArray(TALK_CHUNK_BYTES)
+            while (true) {
+                val read = try {
+                    session.input.read(buffer)
+                } catch (e: Exception) {
+                    -1
+                }
+                if (read < 0) break
+                if (read == 0) continue
+                if (track != null) {
+                    try {
+                        track.write(buffer, 0, read)
+                    } catch (ignored: Exception) {
+                        // A write that fails must not stop the stream.
+                    }
+                }
+                if (role == Role.HUB) {
+                    relayTalkChunk(buffer, read)
+                }
+            }
+        } finally {
+            try {
+                track?.stop()
+            } catch (ignored: Exception) {
+                // Player was never started, or already stopped.
+            }
+            try {
+                track?.release()
+            } catch (ignored: Exception) {
+                // Player already gone.
+            }
+            try {
+                session.input.close()
+            } catch (ignored: Exception) {
+                // Stream already closed.
+            }
+            closeTalkRelays()
+            if (incomingTalk === session) {
+                incomingTalk = null
+                if (peerTalkEndpointId == session.endpointId) {
+                    peerTalkEndpointId = null
+                    peerTalkName = null
+                    handler.post { listener.onTalkEnded() }
+                }
+            }
+        }
+    }
+
+    /**
+     * Reads a stream we are not going to play (see
+     * [onTalkStreamReceived]) to its end and throws the audio away.
+     */
+    private fun drainTalkStream(input: InputStream) {
+        Thread {
+            try {
+                val buffer = ByteArray(TALK_CHUNK_BYTES)
+                while (input.read(buffer) >= 0) {
+                    // Dropped on purpose: the channel was busy.
+                }
+            } catch (ignored: Exception) {
+                // A broken stream drains just as completely.
+            } finally {
+                try {
+                    input.close()
+                } catch (ignored: Exception) {
+                    // Stream already closed.
+                }
+            }
+        }.apply {
+            name = "walkie-talk-drain"
+            isDaemon = true
+            start()
+        }
+    }
+
+    /**
+     * Ends whatever talk state is live, without any listener word
+     * (the connection itself is going away). A playing talk is cut
+     * by closing its stream — its pump unwinds on its own and finds
+     * the state already cleared — and the relay pipes close too.
+     */
+    private fun endTalkStateSilently() {
+        val session = incomingTalk
+        incomingTalk = null
+        peerTalkEndpointId = null
+        peerTalkName = null
+        if (session != null) {
+            try {
+                session.input.close()
+            } catch (ignored: Exception) {
+                // Stream already closed.
+            }
+        }
+        closeTalkRelays()
     }
 
     /**
@@ -769,6 +1353,10 @@ class ChatManager(
         // Transfers that never finished will never report now; their
         // messages simply keep the single "sent" tick.
         outgoingPayloads.clear()
+        // Any live walkie-talkie talk dies with the connection:
+        // our capture stops and a playing talk is cut off.
+        stopTalkInternal()
+        endTalkStateSilently()
         client.stopAdvertising()
         client.stopDiscovery()
         client.stopAllEndpoints()
@@ -1049,6 +1637,25 @@ class ChatManager(
             pendingFiles.remove(endpointId)
             pendingQuotes.remove(endpointId)
             pendingWireIds.remove(endpointId)
+            // The same for a walkie-talkie talk with this phone: its
+            // outgoing talk pipe closes, a talk it was sending us is
+            // cut short (its pump ends the announced talk as it
+            // unwinds), and a talk it had only announced ends here.
+            // When nobody is left, our own talk stops too.
+            closeTalkOutStream(endpointId)
+            val talkSession = incomingTalk
+            if (talkSession != null && talkSession.endpointId == endpointId) {
+                try {
+                    talkSession.input.close()
+                } catch (ignored: Exception) {
+                    // The pump notices either way.
+                }
+            } else if (peerTalkEndpointId == endpointId) {
+                peerTalkEndpointId = null
+                peerTalkName = null
+                listener.onTalkEnded()
+            }
+            if (connectedEndpoints.isEmpty()) stopTalkInternal()
             val iterator = filePayloadEndpoints.entries.iterator()
             while (iterator.hasNext()) {
                 val entry = iterator.next()
@@ -1078,6 +1685,12 @@ class ChatManager(
             // Ignore anything that does not come from a phone in our group.
             if (!connectedEndpoints.containsKey(endpointId)) return
             when (payload.type) {
+                Payload.Type.STREAM -> {
+                    // A walkie-talkie talk: live audio, played (and,
+                    // on the hub, passed on) chunk by chunk. It is
+                    // never stored and never shown as a message.
+                    onTalkStreamReceived(endpointId, payload)
+                }
                 Payload.Type.FILE -> {
                     // Remember the file; it is usable once the transfer
                     // finishes with SUCCESS in onPayloadTransferUpdate.
@@ -1156,6 +1769,15 @@ class ChatManager(
                     val location = parseLocationText(message.text)
                     val reaction = parseReactionText(message.text)
                     when {
+                        // Walkie-talkie control texts ("#TALK#START"
+                        // / "#TALK#END"), handled exactly like the
+                        // location and reaction ones: acted on here,
+                        // never shown as a chat text, and relayed by
+                        // the host below like everything else.
+                        message.text == TALK_START_TEXT ->
+                            onTalkControlStart(endpointId, message.senderName)
+                        message.text == TALK_END_TEXT ->
+                            onTalkControlEnd(endpointId)
                         reaction != null -> listener.onReactionReceived(
                             reaction.first, reaction.second, message.senderName
                         )
@@ -1165,6 +1787,7 @@ class ChatManager(
                         )
                         message.text.startsWith(LOCATION_PREFIX) -> Unit
                         message.text.startsWith(REACT_PREFIX) -> Unit
+                        message.text.startsWith(TALK_PREFIX) -> Unit
                         else -> listener.onMessageReceived(
                             message.text, message.senderName,
                             message.quotedSender, message.quotedText,
@@ -1798,6 +2421,21 @@ class ChatManager(
         // "#REACT#" + target message id + "#" + emoji
         // (see sendReaction / parseReactionText).
         private const val REACT_PREFIX = "#REACT#"
+        // Walkie-talkie control texts, packed inside ordinary text
+        // payloads like "#LOC#" and "#REACT#" are: "#TALK#START"
+        // just before the audio stream opens, "#TALK#END" just
+        // after it closes (see startTalk / stopTalk). The audio
+        // itself never rides a text; it is a STREAM payload.
+        private const val TALK_PREFIX = "#TALK#"
+        private const val TALK_START_TEXT = "#TALK#START"
+        private const val TALK_END_TEXT = "#TALK#END"
+        // The live voice format: 16 kHz mono PCM16, in chunks of
+        // 100 ms — small chunks keep the delay low. A talk is
+        // capped like a voice message is (2 minutes), so a stuck
+        // or forgotten button cannot stream forever.
+        private const val TALK_SAMPLE_RATE = 16_000
+        private const val TALK_CHUNK_BYTES = 3_200 // 100 ms of audio
+        private const val TALK_MAX_NANOS = 120_000_000_000L // 2 minutes
 
         /**
          * The emojis a message can be reacted with, in the order the

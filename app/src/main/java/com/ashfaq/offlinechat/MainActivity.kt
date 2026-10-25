@@ -26,6 +26,7 @@ import android.text.Editable
 import android.text.InputFilter
 import android.text.InputType
 import android.text.TextWatcher
+import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
@@ -127,6 +128,20 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
     }
 
+    // The walkie-talkie's own microphone ask: granting it does not
+    // start a talk by itself (the user holds the button again — the
+    // dialog stays open underneath), it only puts the permission
+    // right and says so.
+    private val talkPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            Toast.makeText(this, R.string.walkie_mic_ready, Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, R.string.mic_permission_needed, Toast.LENGTH_LONG).show()
+        }
+    }
+
     // Asking for the location permission only puts the permission
     // right; the position itself is fetched when the user taps the
     // location button again (the same "tap again after granting"
@@ -140,6 +155,18 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             ).show()
         }
     }
+
+    // Walkie-talkie state: the dialog and its two working parts,
+    // non-null only while the dialog is open; whether our own talk
+    // button is currently held; and who is talking to us right now,
+    // as last reported by ChatManager (kept across the dialog, so
+    // reopening it mid-talk shows the right state).
+    private var walkieDialog: AlertDialog? = null
+    private var walkieStatus: TextView? = null
+    private var walkieButton: MaterialButton? = null
+    private var isTalkingNow = false
+    private var peerTalking = false
+    private var peerTalkingName: String? = null
 
     // Waiting-for-a-fix state: the manager and listener of the one
     // single update that may be in flight, and the providers still
@@ -320,7 +347,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
      * Everything that once crowded the header as its own button —
      * Name, Friends, dark mode, PIN lock, color themes, Clear chat —
      * lives here now, each item calling the very same handler or
-     * dialog its old button called.
+     * dialog its old button called. The Walkie-Talkie item (update
+     * #14) opens its own dialog, described below.
      */
     private fun showOverflowMenu(anchor: View) {
         val itemName = 1
@@ -329,13 +357,15 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         val itemPinLock = 4
         val itemThemes = 5
         val itemClear = 6
+        val itemWalkie = 7
         val popup = PopupMenu(this, anchor)
         popup.menu.add(0, itemName, 0, R.string.your_name)
         popup.menu.add(0, itemFriends, 1, R.string.friends)
         popup.menu.add(0, itemDarkMode, 2, R.string.dark_mode)
         popup.menu.add(0, itemPinLock, 3, R.string.pin_lock_title)
         popup.menu.add(0, itemThemes, 4, R.string.color_themes)
-        popup.menu.add(0, itemClear, 5, R.string.clear_chat)
+        popup.menu.add(0, itemWalkie, 5, R.string.walkie_talkie)
+        popup.menu.add(0, itemClear, 6, R.string.clear_chat)
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 itemName -> showNameDialog()
@@ -343,6 +373,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 itemDarkMode -> toggleDarkMode()
                 itemPinLock -> showPinLockMenu()
                 itemThemes -> showThemesDialog()
+                itemWalkie -> showWalkieTalkieDialog()
                 itemClear -> confirmClearChat()
             }
             true
@@ -373,6 +404,165 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             true
         }
         popup.show()
+    }
+
+    // ---------- Walkie-talkie ----------
+
+    /**
+     * The Walkie-Talkie overflow-menu item: a simple dialog with a
+     * status line and one BIG hold-to-talk button, built in code
+     * like the display-name dialog. Holding the button streams this
+     * phone's microphone live to everyone connected (see
+     * [ChatManager.startTalk]); letting go ends the talk. While
+     * someone else is talking, the button is disabled — half-duplex,
+     * like a real walkie-talkie — and the status line says who it
+     * is. A standard dialog, so it keeps the light dialog theme in
+     * dark mode too, like the app's other dialogs.
+     */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun showWalkieTalkieDialog() {
+        if (closing) return
+        if (!chatManager.isConnected()) {
+            Toast.makeText(
+                this, R.string.walkie_not_connected, Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        // A talk may already be on the channel (it started while
+        // the dialog was closed): pick its state up, so the dialog
+        // opens showing the truth.
+        if (chatManager.isChannelBusy()) {
+            peerTalking = true
+            peerTalkingName = chatManager.currentTalkerName()
+        }
+        val density = resources.displayMetrics.density
+        val side = (20 * density).toInt()
+        val status = TextView(this).apply {
+            textSize = 15f
+            setTextColor(AppColors.textPrimary(this@MainActivity))
+        }
+        val button = MaterialButton(this).apply {
+            text = getString(R.string.walkie_hold_to_talk)
+            textSize = 20f
+            minHeight = (80 * density).toInt()
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = (16 * density).toInt() }
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(side, side / 2, side, 0)
+            addView(status)
+            addView(button)
+        }
+        walkieStatus = status
+        walkieButton = button
+        button.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    onTalkButtonPressed()
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    onTalkButtonReleased()
+                    true
+                }
+                else -> false
+            }
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.walkie_talkie)
+            .setView(container)
+            .setNegativeButton(R.string.friends_close, null)
+            .create()
+        dialog.setOnDismissListener {
+            // A talk must never outlive its dialog: a hot microphone
+            // nobody can see would be a nasty surprise. (A talk that
+            // is playing TO us keeps playing — ChatManager owns it,
+            // and it ends when the talker lets go.)
+            onTalkButtonReleased()
+            if (walkieDialog === dialog) {
+                walkieDialog = null
+                walkieStatus = null
+                walkieButton = null
+            }
+        }
+        walkieDialog = dialog
+        refreshWalkieDialog()
+        dialog.show()
+    }
+
+    /**
+     * The talk button was pressed down. Talking needs the
+     * microphone permission — the same one voice messages use; when
+     * it is missing, it is asked for and this press ends there (the
+     * user holds the button again afterwards, the dialog still
+     * open). A busy channel and a failed start are explained, never
+     * silent.
+     */
+    private fun onTalkButtonPressed() {
+        if (isTalkingNow) return
+        if (peerTalking) return // the button is disabled then, too
+        val granted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            talkPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        if (chatManager.startTalk()) {
+            isTalkingNow = true
+            refreshWalkieDialog()
+        } else {
+            Toast.makeText(
+                this, R.string.walkie_start_failed, Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    /** The talk button was released (or the dialog went away):
+     *  the talk ends. Safe to call when no talk is running. */
+    private fun onTalkButtonReleased() {
+        if (!isTalkingNow) return
+        isTalkingNow = false
+        chatManager.stopTalk()
+        refreshWalkieDialog()
+    }
+
+    /**
+     * Paints the walkie-talkie dialog from the current state: our
+     * own talk in progress, someone else talking (button disabled,
+     * their name on the status line), or a free channel. Does
+     * nothing while the dialog is closed.
+     */
+    private fun refreshWalkieDialog() {
+        val status = walkieStatus ?: return
+        val button = walkieButton ?: return
+        when {
+            isTalkingNow -> {
+                status.text = getString(R.string.walkie_status_talking_you)
+                button.text = getString(R.string.walkie_release_to_stop)
+                button.isEnabled = true
+            }
+            peerTalking -> {
+                status.text = getString(
+                    R.string.walkie_status_talking_other,
+                    peerTalkingName ?: getString(R.string.quote_friend)
+                )
+                button.text = getString(R.string.walkie_hold_to_talk)
+                button.isEnabled = false
+            }
+            else -> {
+                status.text = if (chatManager.isConnected()) {
+                    getString(R.string.walkie_status_ready)
+                } else {
+                    getString(R.string.walkie_not_connected)
+                }
+                button.text = getString(R.string.walkie_hold_to_talk)
+                button.isEnabled = chatManager.isConnected()
+            }
+        }
     }
 
     /** Flips the dark-mode switch and rebuilds the screen in the new palette. */
@@ -488,6 +678,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     override fun onDestroy() {
         closing = true
         requestDialog?.dismiss()
+        // Dismissing the walkie-talkie dialog also ends a talk in
+        // progress, through its dismiss listener.
+        walkieDialog?.dismiss()
         discardRecording()
         stopLocationWait()
         // If the app is closed from the PIN lock screen, startApp()
@@ -1725,6 +1918,14 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     override fun onDisconnected() {
         if (closing) return
         requestDialog?.dismiss()
+        // Any walkie-talkie talk died with the connection; an open
+        // dialog just loses its button (refreshWalkieDialog shows
+        // the not-connected line), it is not closed from under the
+        // user. (ChatManager stops the capture itself.)
+        isTalkingNow = false
+        peerTalking = false
+        peerTalkingName = null
+        refreshWalkieDialog()
         setStatus(getString(R.string.status_disconnected), R.color.status_idle)
     }
 
@@ -1901,6 +2102,51 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 wireId = wireId
             )
         )
+    }
+
+    /**
+     * Someone started talking on the walkie-talkie channel. The
+     * audio itself plays through ChatManager; here we only keep the
+     * state the dialog paints from — or, while the dialog is closed,
+     * let the user know with a toast that a talk is on (they hear
+     * it either way).
+     */
+    override fun onTalkStarted(senderName: String?) {
+        if (closing) return
+        peerTalking = true
+        peerTalkingName = senderName
+        if (walkieDialog != null) {
+            refreshWalkieDialog()
+        } else {
+            Toast.makeText(
+                this,
+                getString(
+                    R.string.walkie_status_talking_other,
+                    senderName ?: getString(R.string.quote_friend)
+                ),
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    /** The walkie-talkie talk ended; the channel is free again. */
+    override fun onTalkEnded() {
+        if (closing) return
+        peerTalking = false
+        peerTalkingName = null
+        refreshWalkieDialog()
+    }
+
+    /**
+     * Our own talk ended by itself (time cap, dead pipes, a
+     * microphone problem) while the button may still be held:
+     * forget that we are talking, so the dialog paints the free
+     * channel and the next press starts cleanly.
+     */
+    override fun onOwnTalkEnded() {
+        if (closing) return
+        isTalkingNow = false
+        refreshWalkieDialog()
     }
 
     override fun onError(message: String) {

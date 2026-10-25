@@ -108,6 +108,16 @@
 <string name="friend_looking">Looking for %1$s...</string>
 <string name="friend_not_found">%1$s not found nearby — make sure their app is open.</string>
 
+<string name="walkie_talkie">Walkie-Talkie</string>
+<string name="walkie_hold_to_talk">🎙 Hold to talk</string>
+<string name="walkie_release_to_stop">Talking… release to stop</string>
+<string name="walkie_status_ready">Hold the button and speak — the other phone hears you live, like a walkie-talkie.</string>
+<string name="walkie_status_talking_you">You are talking…</string>
+<string name="walkie_status_talking_other">🎙 %1$s is talking…</string>
+<string name="walkie_not_connected">Not connected. Walkie-talkie needs a connection first.</string>
+<string name="walkie_start_failed">Could not start talking. Please try again.</string>
+<string name="walkie_mic_ready">Microphone ready — hold the button to talk.</string>
+
 <string name="color_themes">Color theme</string>
 <string name="theme_ocean">Ocean</string>
 <string name="theme_forest">Forest</string>
