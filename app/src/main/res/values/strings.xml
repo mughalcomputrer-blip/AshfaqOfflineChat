@@ -105,4 +105,10 @@
 <string name="friend_looking">Looking for %1$s...</string>
 <string name="friend_not_found">%1$s not found nearby — make sure their app is open.</string>
 
+<string name="color_themes">Color theme</string>
+<string name="theme_ocean">Ocean</string>
+<string name="theme_forest">Forest</string>
+<string name="theme_sunset">Sunset</string>
+<string name="theme_royal">Royal</string>
+
 </resources>

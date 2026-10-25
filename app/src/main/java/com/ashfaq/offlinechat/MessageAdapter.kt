@@ -141,7 +141,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val params = holder.bubble.layoutParams as LinearLayout.LayoutParams
         if (message.isSent) {
             params.gravity = Gravity.END
-            holder.bubble.setBackgroundResource(AppColors.bubbleSentDrawable(context))
+            holder.bubble.background = AppColors.bubbleSentBackground(context)
             holder.messageText.setTextColor(
                 ContextCompat.getColor(context, R.color.bubble_sent_text)
             )
@@ -211,7 +211,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.quoteSenderText.text = quotedSender
             holder.quoteText.text = quotedText
             if (message.isSent) {
-                holder.quoteBlock.setBackgroundResource(AppColors.quoteSentDrawable(context))
+                holder.quoteBlock.background = AppColors.quoteSentBackground(context)
                 holder.quoteStrip.setBackgroundColor(
                     ContextCompat.getColor(context, R.color.on_primary)
                 )

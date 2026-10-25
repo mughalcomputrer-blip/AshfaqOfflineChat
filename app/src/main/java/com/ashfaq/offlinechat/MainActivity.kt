@@ -76,6 +76,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private lateinit var buttonCancelQuote: ImageButton
     private lateinit var buttonLock: TextView
     private lateinit var buttonFriends: TextView
+    private lateinit var buttonThemes: TextView
     private lateinit var lockOverlay: View
     private lateinit var lockTitle: TextView
     private lateinit var lockHint: TextView
@@ -215,6 +216,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonCancelQuote = findViewById(R.id.buttonCancelQuote)
         buttonLock = findViewById(R.id.buttonLock)
         buttonFriends = findViewById(R.id.buttonFriends)
+        buttonThemes = findViewById(R.id.buttonThemes)
         lockOverlay = findViewById(R.id.lockOverlay)
         lockTitle = findViewById(R.id.lockTitle)
         lockHint = findViewById(R.id.lockHint)
@@ -227,11 +229,12 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         // wear the right palette before anything else happens.
         applyThemeColors()
 
-        // These two buttons never touch the chat machinery, so they
-        // can be wired ahead of the PIN gate — though the gate's
-        // overlay keeps both unreachable until the app is unlocked.
+        // These three buttons never touch the chat machinery, so
+        // they can be wired ahead of the PIN gate — though the gate's
+        // overlay keeps them unreachable until the app is unlocked.
         buttonTheme.setOnClickListener { toggleDarkMode() }
         buttonLock.setOnClickListener { showPinLockMenu() }
+        buttonThemes.setOnClickListener { showThemesDialog() }
 
         // The PIN gate. While the lock screen is up, none of the
         // normal startup runs: no chat manager, no saved chat on
@@ -343,6 +346,32 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     }
 
     /**
+     * The 🎨 header button: a single-choice list of the color themes
+     * (update #12), the current one checked. Picking one saves it and
+     * rebuilds the screen in the new skin, exactly like the dark-mode
+     * toggle does. A standard dialog, so it keeps the light dialog
+     * theme in dark mode too — the same accepted limitation as the
+     * app's other dialogs.
+     */
+    private fun showThemesDialog() {
+        val ids = AppColors.THEME_IDS
+        val names = ids.map { getString(AppColors.themeNameRes(it)) }
+            .toTypedArray()
+        val current = ids.indexOf(AppColors.themeId(this))
+        AlertDialog.Builder(this)
+            .setTitle(R.string.color_themes)
+            .setSingleChoiceItems(names, current) { dialog, which ->
+                dialog.dismiss()
+                if (which != current) {
+                    AppColors.setThemeId(this, ids[which])
+                    recreate()
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
      * Paints the whole screen — background, header, quote bar, input
      * row, status bar — from AppColors. Called once in onCreate; with
      * dark mode off it sets exactly the colors the layouts name, so the
@@ -386,6 +415,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonSearch.setTextColor(AppColors.headerText(this))
         buttonLock.setTextColor(AppColors.headerText(this))
         buttonFriends.setTextColor(AppColors.headerText(this))
+        buttonThemes.setTextColor(AppColors.headerText(this))
         searchBar.setBackgroundColor(AppColors.inputBarBackground(this))
         editSearch.setBackgroundResource(AppColors.inputFieldDrawable(this))
         editSearch.setTextColor(AppColors.textPrimary(this))
@@ -405,8 +435,18 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             AppColors.statusColor(this, R.color.status_error)
         )
 
-        // The Find / Disconnect / Send buttons take their colors from
-        // the (light) app theme, which would leave the outlined
+        // The Send and Unlock buttons wear the accent. Their layouts
+        // name @color/accent directly — Ocean's accent — so the
+        // palette repaints them here in every mode, and the chosen
+        // theme's accent reaches them too. With Ocean selected the
+        // value set is the very color the layouts name.
+        buttonSend.backgroundTintList =
+            ColorStateList.valueOf(AppColors.accent(this))
+        buttonUnlock.backgroundTintList =
+            ColorStateList.valueOf(AppColors.accent(this))
+
+        // The Find / Disconnect buttons take their colors from the
+        // (light) app theme, which would leave the outlined
         // Disconnect button nearly invisible on the dark background —
         // in dark mode they get readable colors by hand instead.
         if (dark) {
@@ -416,10 +456,6 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             buttonDisconnect.setTextColor(AppColors.headerText(this))
             buttonDisconnect.strokeColor =
                 ColorStateList.valueOf(AppColors.textSecondary(this))
-            buttonSend.backgroundTintList =
-                ColorStateList.valueOf(AppColors.accent(this))
-            buttonUnlock.backgroundTintList =
-                ColorStateList.valueOf(AppColors.accent(this))
         }
     }
 
