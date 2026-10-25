@@ -63,6 +63,10 @@
 <string name="location_title">📍 Location</string>
 <string name="no_app_for_location">No maps app found on this phone</string>
 
+<string name="search_messages">Search messages</string>
+<string name="search_hint">Search messages…</string>
+<string name="close_search">Close search</string>
+
 <string name="your_name">Name</string>
 <string name="clear_chat">Clear</string>
 <string name="theme_toggle">Dark mode on or off</string>

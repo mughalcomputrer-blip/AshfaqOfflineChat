@@ -22,7 +22,10 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.View
+import android.view.inputmethod.InputMethodManager
 import android.webkit.MimeTypeMap
 import android.widget.EditText
 import android.widget.ImageButton
@@ -54,6 +57,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private lateinit var quoteBar: View
     private lateinit var quoteBarSender: TextView
     private lateinit var quoteBarText: TextView
+    private lateinit var buttonSearch: TextView
+    private lateinit var searchBar: View
+    private lateinit var editSearch: EditText
+    private lateinit var buttonCloseSearch: ImageButton
 
     private var requestDialog: AlertDialog? = null
     private var closing = false
@@ -169,6 +176,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         quoteBar = findViewById(R.id.quoteBar)
         quoteBarSender = findViewById(R.id.quoteBarSender)
         quoteBarText = findViewById(R.id.quoteBarText)
+        buttonSearch = findViewById(R.id.buttonSearch)
+        searchBar = findViewById(R.id.searchBar)
+        editSearch = findViewById(R.id.editSearch)
+        buttonCloseSearch = findViewById(R.id.buttonCloseSearch)
         val buttonFind: MaterialButton = findViewById(R.id.buttonFind)
         val buttonDisconnect: MaterialButton = findViewById(R.id.buttonDisconnect)
         val buttonSend: MaterialButton = findViewById(R.id.buttonSend)
@@ -205,6 +216,22 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonClearChat.setOnClickListener { confirmClearChat() }
         buttonTheme.setOnClickListener { toggleDarkMode() }
         buttonCancelQuote.setOnClickListener { clearPendingQuote() }
+        buttonSearch.setOnClickListener { toggleSearchBar() }
+        buttonCloseSearch.setOnClickListener { closeSearch() }
+        editSearch.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(
+                s: CharSequence?, start: Int, count: Int, after: Int
+            ) {
+            }
+
+            override fun onTextChanged(
+                s: CharSequence?, start: Int, before: Int, count: Int
+            ) {
+                adapter.setFilterQuery(s?.toString() ?: "")
+            }
+
+            override fun afterTextChanged(s: Editable?) {}
+        })
 
         applyThemeColors(buttonFind, buttonDisconnect, buttonSend, buttonTheme)
     }
@@ -260,6 +287,13 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonFile.setColorFilter(AppColors.iconTint(this))
         buttonMic.setColorFilter(AppColors.iconTint(this))
         buttonLocation.setColorFilter(AppColors.iconTint(this))
+
+        buttonSearch.setTextColor(AppColors.headerText(this))
+        searchBar.setBackgroundColor(AppColors.inputBarBackground(this))
+        editSearch.setBackgroundResource(AppColors.inputFieldDrawable(this))
+        editSearch.setTextColor(AppColors.textPrimary(this))
+        editSearch.setHintTextColor(AppColors.textSecondary(this))
+        buttonCloseSearch.setColorFilter(AppColors.textSecondary(this))
 
         // The Find / Disconnect / Send buttons take their colors from
         // the (light) app theme, which would leave the outlined
@@ -399,6 +433,42 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         pendingQuotedSender = null
         pendingQuotedText = null
         quoteBar.visibility = View.GONE
+    }
+
+    // ---------- Chat search ----------
+
+    /**
+     * The 🔍 header button: opens the search bar under the header
+     * (and focuses its field), or closes it again. While the bar is
+     * open, typing narrows the chat list live — the adapter filters
+     * its visible slice; the full chat, and the history saved from
+     * it, stay untouched.
+     */
+    private fun toggleSearchBar() {
+        if (searchBar.visibility == View.VISIBLE) {
+            closeSearch()
+            return
+        }
+        searchBar.visibility = View.VISIBLE
+        editSearch.requestFocus()
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE)
+            as InputMethodManager
+        imm.showSoftInput(editSearch, InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    /**
+     * Closes the search bar: clearing the field makes the watcher
+     * restore the full list, then the bar and keyboard go away.
+     * Sending a message calls this too (see addMessage), so the user
+     * always lands back on the full chat and sees their own bubble.
+     */
+    private fun closeSearch() {
+        if (searchBar.visibility != View.VISIBLE) return
+        editSearch.text.clear()
+        searchBar.visibility = View.GONE
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE)
+            as InputMethodManager
+        imm.hideSoftInputFromWindow(editSearch.windowToken, 0)
     }
 
     /**
@@ -1200,6 +1270,11 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     }
 
     private fun addMessage(message: ChatMessage) {
+        // Our own sends close an open chat search first, so the user
+        // lands back on the full list and sees the bubble they just
+        // sent. Incoming messages leave the search alone: they join
+        // the full list and show in the results only if they match.
+        if (message.isSent) closeSearch()
         adapter.addMessage(message)
         recyclerMessages.scrollToPosition(adapter.itemCount - 1)
         // Keep the on-phone history in step, so the chat survives a restart.

@@ -30,6 +30,19 @@ import java.util.Locale
 class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() {
 
     private val messages = mutableListOf<ChatMessage>()
+
+    // The chat-search filter: the query the user typed (trimmed,
+    // lower-cased) and the slice of [messages] it currently shows.
+    // [messages] stays the full chat and the only list anything ever
+    // mutates — reactions, delivered ticks and the history snapshot
+    // all work on it. [visibleMessages] is a derived view, rebuilt
+    // after every change to the list or the query; item count and
+    // binding read only the visible slice, and every helper that
+    // finds a message finds it in the full list first, then works
+    // out whether (and where) it is currently visible.
+    private var filterQuery: String = ""
+    private var visibleMessages: List<ChatMessage> = emptyList()
+
     private val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
 
     /**
@@ -81,7 +94,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     }
 
     override fun onBindViewHolder(holder: MessageViewHolder, position: Int) {
-        val message = messages[position]
+        val message = visibleMessages[position]
         val context = holder.itemView.context
 
         // A long press on a message opens its menu (reactions and
@@ -336,7 +349,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         }
     }
 
-    override fun getItemCount(): Int = messages.size
+    override fun getItemCount(): Int = visibleMessages.size
 
     override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
         releasePlayer()
@@ -345,7 +358,14 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
 
     fun addMessage(message: ChatMessage) {
         messages.add(message)
-        notifyItemInserted(messages.size - 1)
+        refreshVisible()
+        // The new message is last in the full list, so when the
+        // search lets it through it is also the last visible row.
+        // When it does not match, nothing on screen changed and
+        // there is nothing to announce.
+        if (filterQuery.isEmpty() || matchesQuery(message)) {
+            notifyItemInserted(visibleMessages.size - 1)
+        }
     }
 
     /**
@@ -360,7 +380,12 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         }
         if (index < 0) return false
         messages[index] = messages[index].copy(delivered = true)
-        notifyItemChanged(index)
+        refreshVisible()
+        // Redraw the row only when the search currently shows it.
+        val visibleIndex = visibleMessages.indexOfFirst {
+            it.localId == localId && it.isSent
+        }
+        if (visibleIndex >= 0) notifyItemChanged(visibleIndex)
         return true
     }
 
@@ -391,7 +416,12 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             }
             reactions.getOrPut(emoji) { mutableSetOf() }.add(reactorName)
         }
-        notifyItemChanged(index)
+        // The reaction map lives on the shared message object, so
+        // the full list (and the history saved from it) is already
+        // right; only the row's redraw depends on the search filter.
+        refreshVisible()
+        val visibleIndex = visibleMessages.indexOfFirst { it.wireId == wireId }
+        if (visibleIndex >= 0) notifyItemChanged(visibleIndex)
         return true
     }
 
@@ -414,13 +444,17 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         return parts.takeIf { it.isNotEmpty() }?.joinToString("  ")
     }
 
-    /** A copy of the messages currently shown, oldest first. */
+    /**
+     * A copy of the full chat, oldest first — never the filtered
+     * slice, so a history saved while searching loses nothing.
+     */
     fun snapshot(): List<ChatMessage> = messages.toList()
 
     /** Replaces everything shown with [history] (used at startup). */
     fun setMessages(history: List<ChatMessage>) {
         messages.clear()
         messages.addAll(history)
+        refreshVisible()
         notifyDataSetChanged()
     }
 
@@ -428,7 +462,65 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     fun clearMessages() {
         releasePlayer()
         messages.clear()
+        refreshVisible()
         notifyDataSetChanged()
+    }
+
+    // ---------- Chat search ----------
+
+    /**
+     * Narrows the shown rows to the messages matching [query], or
+     * restores the full chat when it is blank. Only the visible
+     * slice changes — the full list (and with it the saved history,
+     * the reactions and the delivered ticks) is never touched.
+     */
+    fun setFilterQuery(query: String) {
+        val normalized = query.trim().lowercase(Locale.ROOT)
+        if (normalized == filterQuery) return
+        filterQuery = normalized
+        refreshVisible()
+        notifyDataSetChanged()
+    }
+
+    /** Rebuilds the visible slice from the full list and the query. */
+    private fun refreshVisible() {
+        visibleMessages = if (filterQuery.isEmpty()) {
+            messages.toList()
+        } else {
+            messages.filter { matchesQuery(it) }
+        }
+    }
+
+    /**
+     * Whether [message] matches the current search text: a
+     * case-insensitive substring hit on what a chat row actually
+     * shows — the message text, the sender label of a group message,
+     * the quote a reply carries, or a file's name. Photos and videos
+     * also match on the name of the file they are stored under;
+     * voice notes and locations carry no searchable words of their
+     * own, so for them only the sender and quote fields count.
+     */
+    private fun matchesQuery(message: ChatMessage): Boolean {
+        val query = filterQuery
+        if (query.isEmpty()) return true
+        fun hit(value: String?): Boolean =
+            value != null && value.lowercase(Locale.ROOT).contains(query)
+        if (hit(message.senderName) || hit(message.quotedSender) ||
+            hit(message.quotedText)
+        ) {
+            return true
+        }
+        return when (message.type) {
+            ChatMessage.Type.TEXT -> hit(message.text)
+            ChatMessage.Type.FILE -> hit(
+                message.fileName ?: message.filePath?.let { File(it).name }
+            )
+            ChatMessage.Type.PHOTO ->
+                hit(message.imagePath?.let { File(it).name })
+            ChatMessage.Type.VIDEO ->
+                hit(message.videoPath?.let { File(it).name })
+            ChatMessage.Type.VOICE, ChatMessage.Type.LOCATION -> false
+        }
     }
 
     // ---------- Voice playback ----------
@@ -454,10 +546,16 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             return
         }
 
-        // A different message: stop the old one first.
-        val previousPosition = playingPosition
+        // A different message: stop the old one first. The old row
+        // is found by its audio file rather than by the position it
+        // had when playback started: a search typed in the meantime
+        // may have reshuffled (or hidden) the rows since then.
+        val previousPosition = playingVisibleIndex()
+            .takeIf { it >= 0 } ?: playingPosition
         releasePlayer()
-        if (previousPosition >= 0 && previousPosition != position) {
+        if (previousPosition >= 0 && previousPosition != position &&
+            previousPosition < visibleMessages.size
+        ) {
             notifyItemChanged(previousPosition)
         }
 
@@ -485,11 +583,27 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     }
 
     private fun onPlaybackFinished() {
-        val finishedPosition = playingPosition
+        // Same lookup as when switching messages: the finished row
+        // is identified by its file, not by a position that a search
+        // may have moved or hidden while it played.
+        val finishedPosition = playingVisibleIndex()
+            .takeIf { it >= 0 } ?: playingPosition
         releasePlayer()
-        if (finishedPosition >= 0) {
+        if (finishedPosition >= 0 && finishedPosition < visibleMessages.size) {
             notifyItemChanged(finishedPosition)
         }
+    }
+
+    /**
+     * The visible row of the voice message loaded in the player, or
+     * -1 when nothing is loaded or the search currently hides it.
+     * The bind logic picks the pause icon by the same key (the audio
+     * file), so the icon stays right even when this returns -1 — the
+     * row simply redraws with the play icon next time it is bound.
+     */
+    private fun playingVisibleIndex(): Int {
+        val path = playingAudioPath ?: return -1
+        return visibleMessages.indexOfFirst { it.audioPath == path }
     }
 
     private fun releasePlayer() {
