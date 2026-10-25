@@ -12,6 +12,9 @@ data class ChatMessage(
     // Only used for photo messages: where the image file lives on this
     // phone.
     val imagePath: String? = null,
+    // Only used for video messages: where the video file lives on this
+    // phone. The length rides along in durationSeconds, like voice.
+    val videoPath: String? = null,
     // Only used for file messages: where the file lives on this phone,
     // the name it shows in the chat, and how big it is.
     val filePath: String? = null,
@@ -35,5 +38,5 @@ data class ChatMessage(
     val localId: Long = 0,
     val delivered: Boolean = false
 ) {
-    enum class Type { TEXT, VOICE, PHOTO, FILE }
+    enum class Type { TEXT, VOICE, PHOTO, FILE, VIDEO }
 }

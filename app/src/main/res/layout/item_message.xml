@@ -113,6 +113,47 @@
             android:maxWidth="220dp"
             android:visibility="gone" />
 
+        <FrameLayout
+            android:id="@+id/videoContainer"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:visibility="gone">
+
+            <ImageView
+                android:id="@+id/videoThumbnail"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:adjustViewBounds="true"
+                android:contentDescription="@string/video_message"
+                android:maxHeight="300dp"
+                android:maxWidth="220dp" />
+
+            <ImageView
+                android:id="@+id/videoPlayIcon"
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:layout_gravity="center"
+                android:background="@drawable/bg_video_play"
+                android:contentDescription="@string/play_video"
+                android:padding="13dp"
+                android:src="@android:drawable/ic_media_play" />
+
+            <TextView
+                android:id="@+id/videoDurationText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|start"
+                android:layout_marginStart="8dp"
+                android:layout_marginBottom="8dp"
+                android:background="@drawable/bg_video_duration"
+                android:paddingStart="6dp"
+                android:paddingTop="2dp"
+                android:paddingEnd="6dp"
+                android:paddingBottom="2dp"
+                android:textColor="@android:color/white"
+                android:textSize="12sp" />
+        </FrameLayout>
+
         <LinearLayout
             android:id="@+id/fileRow"
             android:layout_width="wrap_content"

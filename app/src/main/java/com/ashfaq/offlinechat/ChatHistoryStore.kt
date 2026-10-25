@@ -12,10 +12,10 @@ import java.util.concurrent.Executors
  * the app's private folder; no database and no extra library is needed
  * (org.json is part of Android itself).
  *
- * Only the newest [MAX_HISTORY] messages are kept. Voice, photo and
- * file entries point at their files; if a file is gone when the history
- * is loaded (for example a sent voice that lived in the cache folder),
- * that entry is simply skipped — it never crashes the load.
+ * Only the newest [MAX_HISTORY] messages are kept. Voice, photo, video
+ * and file entries point at their files; if a file is gone when the
+ * history is loaded (for example a sent voice that lived in the cache
+ * folder), that entry is simply skipped — it never crashes the load.
  */
 object ChatHistoryStore {
 
@@ -85,6 +85,7 @@ object ChatHistoryStore {
             item.put("dur", message.durationSeconds)
             message.audioPath?.let { item.put("audio", it) }
             message.imagePath?.let { item.put("image", it) }
+            message.videoPath?.let { item.put("video", it) }
             message.filePath?.let { item.put("file", it) }
             message.fileName?.let { item.put("fname", it) }
             item.put("fsize", message.fileSizeBytes)
@@ -109,6 +110,9 @@ object ChatHistoryStore {
         }
         val audioPath = if (item.isNull("audio")) null else item.optString("audio")
         val imagePath = if (item.isNull("image")) null else item.optString("image")
+        // Older history files have no "video" key; those entries are
+        // never of type VIDEO, so the default below is never used.
+        val videoPath = if (item.isNull("video")) null else item.optString("video")
         // Older history files have no "file" keys at all; those entries
         // are never of type FILE, and the defaults below keep them loading
         // exactly as before.
@@ -135,13 +139,16 @@ object ChatHistoryStore {
         }
         // Older history files have no "lid"/"delivered" keys either;
         // those own messages then honestly show the single "sent" tick.
-        // A voice, photo or file entry is only useful while its file is
-        // still there; sent files lived in the cache and may be gone by now.
+        // A voice, photo, video or file entry is only useful while its
+        // file is still there; sent files lived in the cache and may be
+        // gone by now.
         when (type) {
             ChatMessage.Type.VOICE ->
                 if (audioPath == null || !File(audioPath).exists()) return null
             ChatMessage.Type.PHOTO ->
                 if (imagePath == null || !File(imagePath).exists()) return null
+            ChatMessage.Type.VIDEO ->
+                if (videoPath == null || !File(videoPath).exists()) return null
             ChatMessage.Type.FILE ->
                 if (filePath == null || !File(filePath).exists()) return null
             ChatMessage.Type.TEXT -> Unit
@@ -154,6 +161,7 @@ object ChatHistoryStore {
             audioPath = audioPath,
             durationSeconds = item.optInt("dur", 0),
             imagePath = imagePath,
+            videoPath = videoPath,
             filePath = filePath,
             fileName = fileName,
             fileSizeBytes = item.optLong("fsize", 0L),

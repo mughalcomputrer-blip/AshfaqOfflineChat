@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.ExifInterface
+import android.media.MediaMetadataRetriever
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
@@ -16,6 +17,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.view.View
+import android.webkit.MimeTypeMap
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
@@ -89,13 +91,24 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
     }
 
-    // The system photo picker: no storage permission is needed, and a
-    // cancelled pick simply gives us nothing (not an error).
+    // The system media picker (photos and videos): no storage
+    // permission is needed, and a cancelled pick simply gives us
+    // nothing (not an error). The picked item's type decides which
+    // send flow it takes.
     private val photoPickerLauncher = registerForActivityResult(
         ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) {
-            prepareAndSendPhoto(uri)
+            val mimeType = try {
+                contentResolver.getType(uri)
+            } catch (e: Exception) {
+                null
+            }
+            if (mimeType != null && mimeType.startsWith("video/")) {
+                prepareAndSendVideo(uri)
+            } else {
+                prepareAndSendPhoto(uri)
+            }
         }
     }
 
@@ -267,6 +280,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         ChatMessage.Type.VOICE ->
             getString(R.string.quote_voice_preview, formatDuration(message.durationSeconds))
         ChatMessage.Type.PHOTO -> getString(R.string.quote_photo_preview)
+        ChatMessage.Type.VIDEO ->
+            getString(R.string.quote_video_preview, formatDuration(message.durationSeconds))
         ChatMessage.Type.FILE -> getString(
             R.string.quote_file_preview,
             message.fileName ?: message.filePath?.let { File(it).name } ?: ""
@@ -415,16 +430,16 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         isRecording = false
     }
 
-    // ---------- Photo messages ----------
+    // ---------- Photo and video messages ----------
 
     private fun onPhotoClicked() {
         if (!chatManager.isConnected()) {
-            Toast.makeText(this, R.string.not_connected_photo, Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, R.string.not_connected_media, Toast.LENGTH_SHORT).show()
             return
         }
         photoPickerLauncher.launch(
             PickVisualMediaRequest.Builder()
-                .setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                .setMediaType(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                 .build()
         )
     }
@@ -568,6 +583,99 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             }
         }
         return inSampleSize
+    }
+
+    // ---------- Video messages ----------
+
+    /**
+     * Copies the picked video into our cache folder (keeping its name)
+     * and sends it as it is — videos are not shrunk or re-encoded
+     * (that would need extra libraries). The same 100 MB cap as for
+     * files applies, checked up front when the picker reports a size
+     * and again during the copy.
+     */
+    private fun prepareAndSendVideo(uri: Uri) {
+        val originalName = queryDisplayName(uri)
+            ?: "video_${System.currentTimeMillis()}"
+        var cleanName = ChatManager.sanitizeFileName(originalName)
+            .ifEmpty { "video_${System.currentTimeMillis()}" }
+        // The player on the other phone (and our own history) is
+        // happier with a proper ending; add the picker's one when the
+        // name has none.
+        if (!cleanName.contains('.')) {
+            val extension = try {
+                contentResolver.getType(uri)?.let {
+                    MimeTypeMap.getSingleton().getExtensionFromMimeType(it)
+                }
+            } catch (e: Exception) {
+                null
+            }
+            if (!extension.isNullOrEmpty()) {
+                cleanName = "$cleanName.$extension"
+            }
+        }
+
+        // When the picker can tell us the size up front, refuse a video
+        // that is too large without copying it first.
+        val knownSize = queryFileSize(uri)
+        if (knownSize != null && knownSize > MAX_FILE_SIZE_BYTES) {
+            onError(getString(R.string.file_too_large))
+            return
+        }
+
+        val file = when (val result = copyPickedFile(uri, cleanName)) {
+            is CopyResult.Done -> result.file
+            CopyResult.TooLarge -> {
+                onError(getString(R.string.file_too_large))
+                return
+            }
+            CopyResult.Failed -> {
+                Toast.makeText(this, R.string.video_failed, Toast.LENGTH_SHORT).show()
+                return
+            }
+        }
+        val durationSeconds = pickedVideoDurationSeconds(file)
+        val localId = nextLocalId++
+        if (!chatManager.sendVideoMessage(
+                file, localId, pendingQuotedSender, pendingQuotedText
+            )
+        ) {
+            Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
+            return
+        }
+        addMessage(
+            ChatMessage(
+                text = "",
+                isSent = true,
+                type = ChatMessage.Type.VIDEO,
+                videoPath = file.absolutePath,
+                durationSeconds = durationSeconds,
+                localId = localId,
+                quotedSender = pendingQuotedSender,
+                quotedText = pendingQuotedText
+            )
+        )
+        clearPendingQuote()
+    }
+
+    /** Reads the length of a video file, in seconds. 0 when unknown. */
+    private fun pickedVideoDurationSeconds(file: File): Int {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(file.absolutePath)
+            val millis = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+            (millis / 1000).toInt()
+        } catch (e: Exception) {
+            0
+        } finally {
+            try {
+                retriever.release()
+            } catch (ignored: Exception) {
+                // Nothing to clean up then.
+            }
+        }
     }
 
     // ---------- File messages ----------
@@ -914,6 +1022,28 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 isSent = false,
                 type = ChatMessage.Type.PHOTO,
                 imagePath = filePath,
+                senderName = senderName,
+                quotedSender = quotedSender,
+                quotedText = quotedText
+            )
+        )
+    }
+
+    override fun onVideoMessageReceived(
+        filePath: String,
+        durationSeconds: Int,
+        senderName: String?,
+        quotedSender: String?,
+        quotedText: String?
+    ) {
+        if (closing) return
+        addMessage(
+            ChatMessage(
+                text = "",
+                isSent = false,
+                type = ChatMessage.Type.VIDEO,
+                videoPath = filePath,
+                durationSeconds = durationSeconds,
                 senderName = senderName,
                 quotedSender = quotedSender,
                 quotedText = quotedText

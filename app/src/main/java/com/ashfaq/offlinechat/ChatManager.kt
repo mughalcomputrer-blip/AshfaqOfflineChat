@@ -41,9 +41,9 @@ import java.util.UUID
  *
  * Replies: a message can quote an earlier one. A text reply carries the
  * quote inside its own payload (so the hub's relay keeps it for free);
- * a voice, photo or file reply is preceded by a tiny "#RPLY#" text
- * holding the quote, paired with the file that follows it in the same
- * per-endpoint way as the file info texts.
+ * a voice, photo, video or file reply is preceded by a tiny "#RPLY#"
+ * text holding the quote, paired with the file that follows it in the
+ * same per-endpoint way as the file info texts.
  */
 class ChatManager(
     context: Context,
@@ -104,6 +104,15 @@ class ChatManager(
         /** A photo arrived; [filePath] points to our own copy of it. */
         fun onPhotoMessageReceived(
             filePath: String,
+            senderName: String?,
+            quotedSender: String?,
+            quotedText: String?
+        ) {}
+
+        /** A video arrived; [filePath] points to our own copy of it. */
+        fun onVideoMessageReceived(
+            filePath: String,
+            durationSeconds: Int,
             senderName: String?,
             quotedSender: String?,
             quotedText: String?
@@ -253,7 +262,7 @@ class ChatManager(
     // endpoint, because in a group two phones can send files around the
     // same time. A file that arrives with no info is treated as voice,
     // like before Phase 5.
-    private enum class IncomingFileKind { VOICE, PHOTO, FILE }
+    private enum class IncomingFileKind { VOICE, PHOTO, FILE, VIDEO }
     private data class PendingFileInfo(
         val kind: IncomingFileKind,
         val voiceDurationSeconds: Int?,
@@ -263,8 +272,8 @@ class ChatManager(
     private val pendingFiles = mutableMapOf<String, PendingFileInfo>()
 
     // A quote that arrived (as a small "#RPLY#" text) just before a
-    // voice, photo or file from the same phone and belongs to that
-    // file's message. Kept per sending endpoint, exactly like
+    // voice, photo, video or file from the same phone and belongs to
+    // that file's message. Kept per sending endpoint, exactly like
     // [pendingFiles]: it is used when the file's transfer finishes,
     // and dropped together with the file info when the transfer fails
     // or the phone leaves, so a quote can never stick to a later,
@@ -429,6 +438,35 @@ class ChatManager(
         return sendInfoAndFile(
             targets, info, file,
             "The photo could not be sent.", localId,
+            replyInfo(quotedSender, quotedText)
+        )
+    }
+
+    /**
+     * Sends a video. Same pattern as photo and file: a file payload
+     * cannot carry any extra info, so we first send a tiny text info
+     * ("#VIDEO#" + sender name + "#" + file name) and then the video
+     * file itself. The length is not in the info text — each phone
+     * reads it from the video file it holds, like the fallback voice
+     * messages already use.
+     */
+    fun sendVideoMessage(
+        file: File,
+        localId: Long = 0,
+        quotedSender: String? = null,
+        quotedText: String? = null
+    ): Boolean {
+        val targets = sendTargets()
+        if (targets.isEmpty()) return false
+        val name = wireSenderName()
+        val info = if (name.isEmpty()) {
+            VIDEO_PREFIX + file.name
+        } else {
+            VIDEO_PREFIX + name + "#" + file.name
+        }
+        return sendInfoAndFile(
+            targets, info, file,
+            "The video could not be sent.", localId,
             replyInfo(quotedSender, quotedText)
         )
     }
@@ -814,6 +852,13 @@ class ChatManager(
                         }
                         return
                     }
+                    if (raw.startsWith(VIDEO_PREFIX)) {
+                        // Info about the video file that follows.
+                        parseVideoInfo(raw)?.let {
+                            pendingFiles[endpointId] = it
+                        }
+                        return
+                    }
                     val message = unpackMessage(raw)
                     if (message.id != null && !rememberMessageId(message.id)) {
                         return // We already showed this message once.
@@ -911,6 +956,19 @@ class ChatManager(
                                 relayFile(dest, info?.senderName, endpointId, quote)
                             }
                         }
+                        IncomingFileKind.VIDEO -> {
+                            val dest = saveReceivedVideoFile(filePayload, info?.fileName) ?: return
+                            // The video info carries no length, so it
+                            // is read from the file we just saved.
+                            val duration = fileDurationSeconds(dest)
+                            listener.onVideoMessageReceived(
+                                dest.absolutePath, duration, info?.senderName,
+                                quote?.sender, quote?.text
+                            )
+                            if (role == Role.HUB) {
+                                relayVideoFile(dest, info?.senderName, endpointId, quote)
+                            }
+                        }
                     }
                 }
             }
@@ -973,6 +1031,25 @@ class ChatManager(
             FILE_PREFIX + file.name
         } else {
             FILE_PREFIX + senderName + "#" + file.name
+        }
+        sendInfoAndFile(
+            targets, info, file, null, 0,
+            replyInfo(quote?.sender, quote?.text)
+        )
+    }
+
+    private fun relayVideoFile(
+        file: File,
+        senderName: String?,
+        exceptEndpointId: String,
+        quote: PendingQuote? = null
+    ) {
+        val targets = sendTargets(exclude = exceptEndpointId)
+        if (targets.isEmpty()) return
+        val info = if (senderName.isNullOrEmpty()) {
+            VIDEO_PREFIX + file.name
+        } else {
+            VIDEO_PREFIX + senderName + "#" + file.name
         }
         sendInfoAndFile(
             targets, info, file, null, 0,
@@ -1062,6 +1139,30 @@ class ChatManager(
     }
 
     /**
+     * Reads a video info text. New form: "#VIDEO#" + sender name + "#" +
+     * file name (split at the FIRST '#', like the file info, because a
+     * file name may itself contain one). Old form: "#VIDEO#" + file
+     * name. The name is cleaned with [sanitizeFileName]; null when
+     * nothing sane is left, so a normal chat text that happens to start
+     * with the prefix is never mistaken for video info.
+     */
+    private fun parseVideoInfo(raw: String): PendingFileInfo? {
+        val rest = raw.substring(VIDEO_PREFIX.length)
+        val separator = rest.indexOf('#')
+        if (separator > 0) {
+            val senderName = rest.substring(0, separator)
+            val fileName = sanitizeFileName(rest.substring(separator + 1))
+            if (fileName.isNotEmpty()) {
+                return PendingFileInfo(IncomingFileKind.VIDEO, null, fileName, senderName)
+            }
+            return null
+        }
+        val fileName = sanitizeFileName(rest)
+        if (fileName.isEmpty()) return null
+        return PendingFileInfo(IncomingFileKind.VIDEO, null, fileName, null)
+    }
+
+    /**
      * Copies a fully received general file into our own storage, keeping
      * its original name. When a file with that name is already there, a
      * suffix like " (1)" is added, so an older file is never overwritten.
@@ -1103,6 +1204,24 @@ class ChatManager(
         if (!copyPayloadFile(filePart, dest) || !dest.exists() || dest.length() == 0L) {
             dest.delete()
             listener.onError("A photo could not be saved.")
+            return null
+        }
+        return dest
+    }
+
+    /**
+     * Copies a fully received video into our own storage, keeping its
+     * original name like a general file does (a suffix like " (1)" is
+     * added when the name is taken, so an older video is never lost).
+     */
+    private fun saveReceivedVideoFile(payload: Payload, wantedName: String?): File? {
+        val filePart = payload.asFile() ?: return null
+        val videoDir = File(appContext.filesDir, VIDEO_DIR_NAME)
+        if (!videoDir.exists()) videoDir.mkdirs()
+        val dest = uniqueFile(videoDir, wantedName ?: "video_${System.currentTimeMillis()}.mp4")
+        if (!copyPayloadFile(filePart, dest) || !dest.exists() || dest.length() == 0L) {
+            dest.delete()
+            listener.onError("A video could not be saved.")
             return null
         }
         return dest
@@ -1280,6 +1399,8 @@ class ChatManager(
         private const val PHOTO_DIR_NAME = "photos"
         private const val FILE_PREFIX = "#FILE#"
         private const val FILE_DIR_NAME = "files"
+        private const val VIDEO_PREFIX = "#VIDEO#"
+        private const val VIDEO_DIR_NAME = "videos"
         private const val MAX_FILE_NAME_LENGTH = 128
 
         /** How many members ("spokes") the host can have: a group is at

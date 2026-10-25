@@ -24,6 +24,10 @@
     <color name="quote_sent_text">#E6FFFFFF</color>
     <color name="quote_received_bg">#E9EFF5</color>
 
+    <!-- The stand-in shown in a video bubble when no frame could be
+         read from the video file. -->
+    <color name="video_placeholder">#263238</color>
+
     <color name="input_bar_background">#FFFFFF</color>
     <color name="input_stroke">#D9E1EA</color>
 

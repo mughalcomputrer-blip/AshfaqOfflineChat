@@ -28,10 +28,13 @@
 <string name="not_connected_voice">Not connected. Voice message not recorded.</string>
 <string name="voice_recording_failed">Recording failed. Please try again.</string>
 <string name="voice_sent">Voice message sent</string>
-<string name="pick_photo">Send a photo</string>
+<string name="pick_media">Send a photo or video</string>
 <string name="photo_message">Photo message</string>
-<string name="not_connected_photo">Not connected. Photo not sent.</string>
+<string name="not_connected_media">Not connected. Photo or video not sent.</string>
 <string name="photo_failed">The photo could not be sent.</string>
+<string name="video_message">Video message</string>
+<string name="play_video">Play video</string>
+<string name="video_failed">The video could not be sent.</string>
 <string name="send_file">Send a file</string>
 <string name="file_message">File message</string>
 <string name="not_connected_file">Not connected. File not sent.</string>
@@ -46,6 +49,7 @@
 <string name="quote_friend">Friend</string>
 <string name="quote_voice_preview">🎙 Voice message (%1$s)</string>
 <string name="quote_photo_preview">📷 Photo</string>
+<string name="quote_video_preview">🎥 Video (%1$s)</string>
 <string name="quote_file_preview">📄 %1$s</string>
 <string name="cancel_reply">Cancel reply</string>
 

@@ -189,7 +189,7 @@
             android:layout_height="48dp"
             android:layout_marginStart="4dp"
             android:background="@android:color/transparent"
-            android:contentDescription="@string/pick_photo"
+            android:contentDescription="@string/pick_media"
             android:src="@android:drawable/ic_menu_gallery"
             android:tint="@color/primary" />
 

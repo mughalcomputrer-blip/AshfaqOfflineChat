@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -55,6 +56,10 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val buttonPlay: ImageButton = view.findViewById(R.id.buttonPlay)
         val durationText: TextView = view.findViewById(R.id.durationText)
         val photoImage: ImageView = view.findViewById(R.id.photoImage)
+        val videoContainer: View = view.findViewById(R.id.videoContainer)
+        val videoThumbnail: ImageView = view.findViewById(R.id.videoThumbnail)
+        val videoPlayIcon: ImageView = view.findViewById(R.id.videoPlayIcon)
+        val videoDurationText: TextView = view.findViewById(R.id.videoDurationText)
         val fileRow: View = view.findViewById(R.id.fileRow)
         val fileIcon: ImageView = view.findViewById(R.id.fileIcon)
         val fileNameText: TextView = view.findViewById(R.id.fileNameText)
@@ -82,6 +87,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         }
         holder.bubble.setOnLongClickListener(replyOnLongClick)
         holder.photoImage.setOnLongClickListener(replyOnLongClick)
+        holder.videoThumbnail.setOnLongClickListener(replyOnLongClick)
         holder.buttonPlay.setOnLongClickListener(replyOnLongClick)
 
         holder.messageText.text = message.text
@@ -204,6 +210,8 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.messageText.visibility = View.GONE
                 holder.photoImage.visibility = View.GONE
                 holder.photoImage.setOnClickListener(null)
+                holder.videoContainer.visibility = View.GONE
+                holder.videoThumbnail.setOnClickListener(null)
                 holder.fileRow.visibility = View.GONE
                 holder.bubble.setOnClickListener(null)
                 holder.voiceRow.visibility = View.VISIBLE
@@ -222,6 +230,8 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.messageText.visibility = View.GONE
                 holder.voiceRow.visibility = View.GONE
                 holder.buttonPlay.setOnClickListener(null)
+                holder.videoContainer.visibility = View.GONE
+                holder.videoThumbnail.setOnClickListener(null)
                 holder.fileRow.visibility = View.GONE
                 holder.bubble.setOnClickListener(null)
                 holder.photoImage.visibility = View.VISIBLE
@@ -241,6 +251,8 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.buttonPlay.setOnClickListener(null)
                 holder.photoImage.visibility = View.GONE
                 holder.photoImage.setOnClickListener(null)
+                holder.videoContainer.visibility = View.GONE
+                holder.videoThumbnail.setOnClickListener(null)
                 holder.fileRow.visibility = View.VISIBLE
                 holder.fileNameText.text = message.fileName
                     ?: message.filePath?.let { File(it).name }
@@ -248,12 +260,36 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.fileSizeText.text = formatFileSize(message.fileSizeBytes)
                 holder.bubble.setOnClickListener { openFile(context, message) }
             }
+            ChatMessage.Type.VIDEO -> {
+                holder.messageText.visibility = View.GONE
+                holder.voiceRow.visibility = View.GONE
+                holder.buttonPlay.setOnClickListener(null)
+                holder.photoImage.visibility = View.GONE
+                holder.photoImage.setOnClickListener(null)
+                holder.fileRow.visibility = View.GONE
+                holder.videoContainer.visibility = View.VISIBLE
+                val path = message.videoPath
+                val thumbWidthPx = (220 * context.resources.displayMetrics.density).toInt()
+                val frame = path?.let { grabVideoFrame(it, thumbWidthPx) }
+                holder.videoThumbnail.setImageBitmap(
+                    frame ?: videoPlaceholderBitmap(context)
+                )
+                holder.videoPlayIcon.setColorFilter(
+                    ContextCompat.getColor(context, android.R.color.white)
+                )
+                holder.videoDurationText.text = formatDuration(message.durationSeconds)
+                val openOnClick = View.OnClickListener { openVideo(context, message) }
+                holder.videoThumbnail.setOnClickListener(openOnClick)
+                holder.bubble.setOnClickListener(openOnClick)
+            }
             ChatMessage.Type.TEXT -> {
                 holder.messageText.visibility = View.VISIBLE
                 holder.voiceRow.visibility = View.GONE
                 holder.photoImage.visibility = View.GONE
                 holder.photoImage.setOnClickListener(null)
                 holder.buttonPlay.setOnClickListener(null)
+                holder.videoContainer.visibility = View.GONE
+                holder.videoThumbnail.setOnClickListener(null)
                 holder.fileRow.visibility = View.GONE
                 holder.bubble.setOnClickListener(null)
             }
@@ -441,6 +477,100 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             .setView(imageView)
             .setPositiveButton(android.R.string.ok) { dialog, _ -> dialog.dismiss() }
             .show()
+    }
+
+    // ---------- Videos ----------
+
+    // The dark stand-in shown when a video has no readable frame;
+    // built once and shared by every video row.
+    private var videoPlaceholder: Bitmap? = null
+
+    private fun videoPlaceholderBitmap(context: Context): Bitmap {
+        videoPlaceholder?.let { return it }
+        val bitmap = Bitmap.createBitmap(440, 260, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(ContextCompat.getColor(context, R.color.video_placeholder))
+        videoPlaceholder = bitmap
+        return bitmap
+    }
+
+    /**
+     * Grabs one frame from the video at [path] (about a second in,
+     * falling back to the very first frame), scaled down to at most
+     * [maxWidthPx] wide so the chat list never holds a full-size frame.
+     * Null when the file cannot be read as a video at all.
+     */
+    private fun grabVideoFrame(path: String, maxWidthPx: Int): Bitmap? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(path)
+            val frame = retriever.getFrameAtTime(
+                1_000_000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+            ) ?: retriever.getFrameAtTime(
+                0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+            )
+            if (frame != null && frame.width > maxWidthPx) {
+                val scale = maxWidthPx.toFloat() / frame.width
+                val scaled = Bitmap.createScaledBitmap(
+                    frame,
+                    maxWidthPx,
+                    (frame.height * scale).toInt().coerceAtLeast(1),
+                    true
+                )
+                if (scaled !== frame) {
+                    frame.recycle()
+                }
+                scaled
+            } else {
+                frame
+            }
+        } catch (e: Exception) {
+            null
+        } finally {
+            try {
+                retriever.release()
+            } catch (ignored: Exception) {
+                // Nothing to clean up then.
+            }
+        }
+    }
+
+    /**
+     * Plays a tapped video in the phone's own video player, through
+     * FileProvider (the private folder and the cache folder are both
+     * shared roots, so received and sent videos both work). A friendly
+     * Toast appears when that is not possible.
+     */
+    private fun openVideo(context: Context, message: ChatMessage) {
+        val path = message.videoPath
+        val file = path?.let { File(it) }
+        if (file == null || !file.exists()) {
+            Toast.makeText(context, R.string.file_gone, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = try {
+            FileProvider.getUriForFile(
+                context, context.packageName + ".fileprovider", file
+            )
+        } catch (e: Exception) {
+            Toast.makeText(context, R.string.file_gone, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val extensionMime = MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(file.extension.lowercase(Locale.ROOT))
+        val mimeType = if (extensionMime != null && extensionMime.startsWith("video/")) {
+            extensionMime
+        } else {
+            "video/*"
+        }
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(context, R.string.no_app_for_file, Toast.LENGTH_SHORT).show()
+        }
     }
 
     // ---------- Files ----------
