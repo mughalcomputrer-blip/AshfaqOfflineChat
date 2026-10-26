@@ -54,7 +54,18 @@ data class ChatMessage(
     // people who reacted with it. A person appears under at most one
     // emoji (reacting with another one moves them, reacting with the
     // same one again removes them). Empty when nobody reacted.
-    val reactions: MutableMap<String, MutableSet<String>> = mutableMapOf()
+    val reactions: MutableMap<String, MutableSet<String>> = mutableMapOf(),
+    // True once the author edited this message (only text messages
+    // can be edited): the bubble then shows a small "edited" caption
+    // next to the time, on every phone.
+    val edited: Boolean = false,
+    // True once the author deleted this message for everyone: every
+    // phone replaces the bubble with the "This message was deleted"
+    // placeholder instead of removing the row, so quotes, reactions
+    // and history positions around it stay sane; its own reactions
+    // are cleared and (on the phones that received it) its media
+    // file is deleted. Our own copy is marked exactly the same way.
+    val deleted: Boolean = false
 ) {
     enum class Type { TEXT, VOICE, PHOTO, FILE, VIDEO, LOCATION }
 }

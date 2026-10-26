@@ -103,6 +103,11 @@ object ChatHistoryStore {
             // The id the other phones know this message by, so a
             // reaction can still find it after a restart.
             message.wireId?.let { item.put("wid", it) }
+            // Whether the author edited or deleted the message.
+            // Only written when true, so untouched messages keep
+            // the exact shape they always had.
+            if (message.edited) item.put("edited", true)
+            if (message.deleted) item.put("deleted", true)
             // The reactions on the message: emoji -> the names of the
             // people who reacted with it. Only written when non-empty.
             if (message.reactions.isNotEmpty()) {
@@ -190,18 +195,25 @@ object ChatHistoryStore {
         }
         // Older history files have no "lid"/"delivered" keys either;
         // those own messages then honestly show the single "sent" tick.
+        // They have no "edited"/"deleted" keys either; both default
+        // to false, so old messages load exactly as they were saved.
+        val edited = item.optBoolean("edited", false)
+        val deleted = item.optBoolean("deleted", false)
         // A voice, photo, video or file entry is only useful while its
         // file is still there; sent files lived in the cache and may be
-        // gone by now.
+        // gone by now. A DELETED entry is the exception: its file was
+        // removed on purpose when the delete arrived, and the row is
+        // now just a placeholder that must survive the restart, so it
+        // loads whether or not the file is still there.
         when (type) {
             ChatMessage.Type.VOICE ->
-                if (audioPath == null || !File(audioPath).exists()) return null
+                if (!deleted && (audioPath == null || !File(audioPath).exists())) return null
             ChatMessage.Type.PHOTO ->
-                if (imagePath == null || !File(imagePath).exists()) return null
+                if (!deleted && (imagePath == null || !File(imagePath).exists())) return null
             ChatMessage.Type.VIDEO ->
-                if (videoPath == null || !File(videoPath).exists()) return null
+                if (!deleted && (videoPath == null || !File(videoPath).exists())) return null
             ChatMessage.Type.FILE ->
-                if (filePath == null || !File(filePath).exists()) return null
+                if (!deleted && (filePath == null || !File(filePath).exists())) return null
             // A location points at no file, so nothing can be missing.
             ChatMessage.Type.LOCATION -> Unit
             ChatMessage.Type.TEXT -> Unit
@@ -226,7 +238,9 @@ object ChatHistoryStore {
             localId = item.optLong("lid", 0L),
             delivered = item.optBoolean("delivered", false),
             wireId = wireId,
-            reactions = reactions
+            reactions = reactions,
+            edited = edited,
+            deleted = deleted
         )
     }
 }

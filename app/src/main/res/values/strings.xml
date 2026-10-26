@@ -46,6 +46,16 @@
 <string name="error_hint">Make sure Bluetooth and Location are turned on, and that the other phone is also searching.</string>
 
 <string name="reply">Reply</string>
+<string name="edit_message">Edit</string>
+<string name="edit_message_title">Edit message</string>
+<string name="delete_for_everyone">Delete for everyone</string>
+<string name="delete_message_title">Delete message?</string>
+<string name="delete_message_text">This message will be deleted for everyone.</string>
+<string name="delete_message_confirm">Delete</string>
+<string name="message_deleted">🚫 This message was deleted</string>
+<string name="message_edited">edited</string>
+<string name="not_connected_edit">Not connected. Message not edited.</string>
+<string name="not_connected_delete">Not connected. Message not deleted.</string>
 <string name="quote_friend">Friend</string>
 <string name="quote_voice_preview">🎙 Voice message (%1$s)</string>
 <string name="quote_photo_preview">📷 Photo</string>

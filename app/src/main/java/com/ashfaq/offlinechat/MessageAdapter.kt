@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.net.Uri
@@ -83,6 +84,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val locationTitleText: TextView = view.findViewById(R.id.locationTitleText)
         val locationCoordsText: TextView = view.findViewById(R.id.locationCoordsText)
         val reactionsText: TextView = view.findViewById(R.id.reactionsText)
+        val editedText: TextView = view.findViewById(R.id.editedText)
         val timeText: TextView = view.findViewById(R.id.timeText)
         val ticksText: TextView = view.findViewById(R.id.ticksText)
     }
@@ -127,6 +129,15 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.ticksText.text = null
         }
 
+        // The small "edited" caption before the time, on a message
+        // its author corrected. A deleted message is a placeholder
+        // now and shows no caption.
+        if (message.edited && !message.deleted) {
+            holder.editedText.visibility = View.VISIBLE
+        } else {
+            holder.editedText.visibility = View.GONE
+        }
+
         // In a group, a received message shows who originally sent it.
         // Our own messages (and nameless ones from older versions) don't.
         val senderName = message.senderName
@@ -146,6 +157,9 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 ContextCompat.getColor(context, R.color.bubble_sent_text)
             )
             holder.timeText.setTextColor(
+                ContextCompat.getColor(context, R.color.bubble_sent_text)
+            )
+            holder.editedText.setTextColor(
                 ContextCompat.getColor(context, R.color.bubble_sent_text)
             )
             holder.durationText.setTextColor(
@@ -177,6 +191,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.bubble.setBackgroundResource(AppColors.bubbleReceivedDrawable(context))
             holder.messageText.setTextColor(AppColors.bubbleReceivedText(context))
             holder.timeText.setTextColor(AppColors.textSecondary(context))
+            holder.editedText.setTextColor(AppColors.textSecondary(context))
             holder.durationText.setTextColor(AppColors.bubbleReceivedText(context))
             holder.buttonPlay.setColorFilter(AppColors.accent(context))
             holder.fileNameText.setTextColor(AppColors.bubbleReceivedText(context))
@@ -235,7 +250,33 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.quoteText.text = null
         }
 
-        when (message.type) {
+        if (message.deleted) {
+            // The author deleted this message for everyone: every
+            // content row goes away and the bubble is just the
+            // placeholder line, in italic like WhatsApp's. The quote
+            // it carried and its reactions went with the delete, so
+            // those blocks hide too; the sender label, the time and
+            // the ticks stay, and the row itself keeps its place.
+            holder.messageText.visibility = View.VISIBLE
+            holder.messageText.text = context.getString(R.string.message_deleted)
+            holder.messageText.setTypeface(
+                holder.messageText.typeface, Typeface.ITALIC
+            )
+            if (!message.isSent) {
+                holder.messageText.setTextColor(AppColors.textSecondary(context))
+            }
+            holder.voiceRow.visibility = View.GONE
+            holder.buttonPlay.setOnClickListener(null)
+            holder.photoImage.visibility = View.GONE
+            holder.photoImage.setOnClickListener(null)
+            holder.videoContainer.visibility = View.GONE
+            holder.videoThumbnail.setOnClickListener(null)
+            holder.fileRow.visibility = View.GONE
+            holder.locationRow.visibility = View.GONE
+            holder.quoteBlock.visibility = View.GONE
+            holder.reactionsText.visibility = View.GONE
+            holder.bubble.setOnClickListener(null)
+        } else when (message.type) {
             ChatMessage.Type.VOICE -> {
                 holder.messageText.visibility = View.GONE
                 holder.photoImage.visibility = View.GONE
@@ -336,6 +377,9 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             }
             ChatMessage.Type.TEXT -> {
                 holder.messageText.visibility = View.VISIBLE
+                // A recycled row may come from a deleted message,
+                // whose placeholder set the text italic.
+                holder.messageText.setTypeface(Typeface.DEFAULT, Typeface.NORMAL)
                 holder.voiceRow.visibility = View.GONE
                 holder.photoImage.visibility = View.GONE
                 holder.photoImage.setOnClickListener(null)
@@ -402,6 +446,10 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     fun applyReaction(wireId: String, emoji: String, reactorName: String): Boolean {
         val index = messages.indexOfFirst { it.wireId == wireId }
         if (index < 0) return false
+        // A deleted message is a placeholder; its reactions were
+        // cleared with it and a late reaction (sent before the
+        // delete arrived) must not bring them back.
+        if (messages[index].deleted) return false
         val reactions = messages[index].reactions
         // The emoji this person has on the message now, if any.
         val current = reactions.entries
@@ -423,6 +471,137 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val visibleIndex = visibleMessages.indexOfFirst { it.wireId == wireId }
         if (visibleIndex >= 0) notifyItemChanged(visibleIndex)
         return true
+    }
+
+    // ---------- Edits & deletes ----------
+
+    /**
+     * Whether a command that arrived from another phone may touch
+     * [message]: the command's stamped name ([commandName]) must be
+     * the name of the person who sent the message. Our own messages
+     * are never anybody else's to edit or delete (we change those
+     * ourselves, locally); a received message whose author is
+     * unknown (saved by an older app version) cannot be verified
+     * either, so commands for it are dropped too. In a group the
+     * name is the original author's, which the hub's word-for-word
+     * relay preserves — so this check means the same thing on every
+     * phone, exactly like a reaction's name.
+     */
+    private fun isCommandFromAuthor(message: ChatMessage, commandName: String?): Boolean =
+        !message.isSent && !commandName.isNullOrBlank() &&
+            message.senderName == commandName
+
+    /** Redraws the row of the message known by [wireId], if shown. */
+    private fun notifyMessageChanged(wireId: String) {
+        val visibleIndex = visibleMessages.indexOfFirst { it.wireId == wireId }
+        if (visibleIndex >= 0) notifyItemChanged(visibleIndex)
+    }
+
+    /**
+     * Applies an edit that arrived from another phone to the text
+     * message known by [wireId]: its text becomes [newText] and the
+     * "edited" caption appears. Applies only when [editorName] is
+     * the message's author (see [isCommandFromAuthor]); a deleted
+     * message and a media message cannot be edited at all. The
+     * quote a reply made of this message is a snapshot and is NOT
+     * rewritten. Returns false when nothing changed, so the caller
+     * only saves the history on a real change.
+     */
+    fun applyEdit(wireId: String, newText: String, editorName: String?): Boolean {
+        val index = messages.indexOfFirst { it.wireId == wireId }
+        if (index < 0) return false
+        val message = messages[index]
+        if (message.deleted || message.type != ChatMessage.Type.TEXT) return false
+        if (!isCommandFromAuthor(message, editorName)) return false
+        messages[index] = message.copy(text = newText, edited = true)
+        refreshVisible()
+        notifyMessageChanged(wireId)
+        return true
+    }
+
+    /**
+     * Applies a delete-for-everyone that arrived from another
+     * phone to the message known by [wireId]. Applies only when
+     * [deleterName] is the message's author (see
+     * [isCommandFromAuthor]). The row becomes the deleted
+     * placeholder (see [markDeleted]). Returns false when nothing
+     * changed.
+     */
+    fun applyDelete(wireId: String, deleterName: String?): Boolean {
+        val index = messages.indexOfFirst { it.wireId == wireId }
+        if (index < 0) return false
+        val message = messages[index]
+        if (message.deleted) return false
+        if (!isCommandFromAuthor(message, deleterName)) return false
+        markDeleted(index)
+        return true
+    }
+
+    /**
+     * Edits one of OUR OWN text messages on our own screen (the
+     * edit command itself is broadcast by the caller through
+     * ChatManager). Same rules as [applyEdit] otherwise.
+     */
+    fun editOwnMessage(wireId: String, newText: String): Boolean {
+        val index = messages.indexOfFirst { it.wireId == wireId && it.isSent }
+        if (index < 0) return false
+        val message = messages[index]
+        if (message.deleted || message.type != ChatMessage.Type.TEXT) return false
+        messages[index] = message.copy(text = newText, edited = true)
+        refreshVisible()
+        notifyMessageChanged(wireId)
+        return true
+    }
+
+    /**
+     * Deletes one of OUR OWN messages on our own screen (the
+     * delete command itself is broadcast by the caller through
+     * ChatManager), exactly like a delete that arrives from the
+     * author does on the other phones.
+     */
+    fun deleteOwnMessage(wireId: String): Boolean {
+        val index = messages.indexOfFirst { it.wireId == wireId && it.isSent }
+        if (index < 0) return false
+        if (messages[index].deleted) return false
+        markDeleted(index)
+        return true
+    }
+
+    /**
+     * Turns the message at [index] into the deleted placeholder:
+     * the text is dropped, the reactions are cleared, and the
+     * message is flagged deleted — the row itself stays, so quotes
+     * of it, other messages' reactions and the history positions
+     * are unaffected. The media file behind a voice, photo, video
+     * or file message is deleted from this phone on a best-effort
+     * basis (a voice that is playing right now stops first); the
+     * recorded path stays on the row, unused, so a history saved
+     * from here reloads the placeholder (the history store keeps
+     * deleted rows whose file is gone).
+     */
+    private fun markDeleted(index: Int) {
+        val message = messages[index]
+        val mediaPath = when (message.type) {
+            ChatMessage.Type.VOICE -> message.audioPath
+            ChatMessage.Type.PHOTO -> message.imagePath
+            ChatMessage.Type.VIDEO -> message.videoPath
+            ChatMessage.Type.FILE -> message.filePath
+            ChatMessage.Type.TEXT, ChatMessage.Type.LOCATION -> null
+        }
+        if (mediaPath != null && mediaPath == playingAudioPath) {
+            releasePlayer()
+        }
+        message.reactions.clear()
+        messages[index] = message.copy(text = "", deleted = true)
+        if (mediaPath != null) {
+            try {
+                File(mediaPath).delete()
+            } catch (ignored: Exception) {
+                // Best effort only: the placeholder shows either way.
+            }
+        }
+        refreshVisible()
+        message.wireId?.let { notifyMessageChanged(it) }
     }
 
     /**

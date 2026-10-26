@@ -72,6 +72,20 @@ import java.util.UUID
  * a chat text. The hub also applies a reaction it relays, so its
  * own screen stays in step with the group.
  *
+ * Edits and deletes: a message's author can correct or take back
+ * their own message. An edit rides an ordinary text payload whose
+ * text is "#EDIT#" + the message's id + "#" + the new text; a
+ * delete-for-everyone rides one whose text is "#DEL#" + the id.
+ * Both therefore carry the author's name in the "#FROM#" section,
+ * get the usual dedupe, and the hub relays them word for word,
+ * exactly like a reaction; the receiving side recognises them
+ * here, never shows them as chat texts, and reports them to the
+ * listener. Only the author may do either — the screen applies a
+ * command only when its stamped name matches the target message's
+ * author, and drops it quietly otherwise. A delete does not remove
+ * the chat row: the bubble becomes a placeholder on every phone,
+ * so quotes and history around it stay in place.
+ *
  * Friends: every phone a connection is made with is remembered in
  * [FriendsStore] under its base name ([baseNameOf]), whichever side
  * asked and whichever side accepted. [findFriend] then reconnects
@@ -162,6 +176,32 @@ class ChatManager(
             targetWireId: String,
             emoji: String,
             reactorName: String?
+        ) {}
+
+        /**
+         * The author of a message edited it: the message known by
+         * [targetWireId] now reads [newText]. [editorName] is the
+         * stamped "#FROM#" name on the edit command (null only when
+         * the payload carried no name); the screen applies the edit
+         * only when that name is the target message's author, so an
+         * edit command can never rewrite somebody else's message.
+         */
+        fun onMessageEdited(
+            targetWireId: String,
+            newText: String,
+            editorName: String?
+        ) {}
+
+        /**
+         * The author of a message deleted it for everyone: the
+         * message known by [targetWireId] becomes a placeholder (its
+         * row stays). [deleterName] is the stamped "#FROM#" name on
+         * the delete command; the same authorship rule as for
+         * [onMessageEdited] applies.
+         */
+        fun onMessageDeleted(
+            targetWireId: String,
+            deleterName: String?
         ) {}
 
         /**
@@ -653,6 +693,43 @@ class ChatManager(
     fun sendReaction(targetWireId: String, emoji: String): Boolean {
         if (targetWireId.isEmpty() || emoji !in REACTION_EMOJIS) return false
         return sendMessage(REACT_PREFIX + targetWireId + "#" + emoji)
+    }
+
+    /**
+     * Edits one of our own text messages: the message the other
+     * phones know by [targetWireId] now reads [newText]. The edit
+     * is packed into a control text ("#EDIT#" + target id + "#" +
+     * new text) and sent through the ordinary text path
+     * ([sendMessage]), so it carries this phone's name in the
+     * "#FROM#" section — the name is how the other phones check
+     * that the editor really is the message's author — and the hub
+     * relays it word for word; the receiving side recognises the
+     * control text in [parseEditText] and never shows it as a chat
+     * text. The new text rides after the id verbatim: the id is a
+     * fixed-length UUID with no '#' in it, so the text is taken as
+     * everything after the one separator, and a '#' inside the text
+     * itself cannot break the format (the same arrangement as a
+     * file name after its sender in "#FILE#").
+     */
+    fun sendEditMessage(targetWireId: String, newText: String): Boolean {
+        if (targetWireId.isEmpty() || newText.isEmpty()) return false
+        return sendMessage(EDIT_PREFIX + targetWireId + "#" + newText)
+    }
+
+    /**
+     * Deletes one of our own messages for everyone: the message
+     * the other phones know by [targetWireId] becomes a "This
+     * message was deleted" placeholder there (its row stays). The
+     * command is packed into a control text ("#DEL#" + target id)
+     * and sent through the ordinary text path ([sendMessage]), so
+     * it carries this phone's name for the authorship check, gets
+     * the usual dedupe, and the hub relays it word for word; the
+     * receiving side recognises it in [parseDeleteText] and never
+     * shows it as a chat text.
+     */
+    fun sendDeleteMessage(targetWireId: String): Boolean {
+        if (targetWireId.isEmpty()) return false
+        return sendMessage(DELETE_PREFIX + targetWireId)
     }
 
     // ----- Walkie-talkie (live push-to-talk voice) -----
@@ -1768,6 +1845,8 @@ class ChatManager(
                     // same way: reported to the listener, never shown.
                     val location = parseLocationText(message.text)
                     val reaction = parseReactionText(message.text)
+                    val edit = parseEditText(message.text)
+                    val deletion = parseDeleteText(message.text)
                     when {
                         // Walkie-talkie control texts ("#TALK#START"
                         // / "#TALK#END"), handled exactly like the
@@ -1781,12 +1860,26 @@ class ChatManager(
                         reaction != null -> listener.onReactionReceived(
                             reaction.first, reaction.second, message.senderName
                         )
+                        // An edit or a delete-for-everyone ("#EDIT#" /
+                        // "#DEL#" control texts) is handled the same
+                        // way: reported to the listener (which applies
+                        // it only when its stamped name is the target
+                        // message's author), never shown as a chat
+                        // text, and relayed by the host below.
+                        edit != null -> listener.onMessageEdited(
+                            edit.first, edit.second, message.senderName
+                        )
+                        deletion != null -> listener.onMessageDeleted(
+                            deletion, message.senderName
+                        )
                         location != null -> listener.onLocationMessageReceived(
                             location.first, location.second, message.senderName,
                             message.id
                         )
                         message.text.startsWith(LOCATION_PREFIX) -> Unit
                         message.text.startsWith(REACT_PREFIX) -> Unit
+                        message.text.startsWith(EDIT_PREFIX) -> Unit
+                        message.text.startsWith(DELETE_PREFIX) -> Unit
                         message.text.startsWith(TALK_PREFIX) -> Unit
                         else -> listener.onMessageReceived(
                             message.text, message.senderName,
@@ -2038,6 +2131,56 @@ class ChatManager(
         val emoji = rest.substring(separator + 1)
         if (emoji !in REACTION_EMOJIS) return null
         return target to emoji
+    }
+
+    /**
+     * Whether [value] has the shape of a message id: a UUID, 36
+     * characters with dashes where a UUID has them (the same check
+     * [parseMessageIdInfo] makes). Every id a message is known by
+     * — the "#ID#" of a text or location, the "#MID#" of a media
+     * message — has this shape.
+     */
+    private fun isMessageIdShape(value: String): Boolean =
+        value.length == MESSAGE_ID_LENGTH &&
+            value[8] == '-' && value[13] == '-' && value[18] == '-' &&
+            value[23] == '-'
+
+    /**
+     * Reads an edit control text: "#EDIT#" + target message id +
+     * "#" + the new text. The id must have the exact message-id
+     * shape, so a typed chat text can never be taken for an edit;
+     * the new text is everything after the separator and must be
+     * non-empty — it may itself contain '#', because the fixed-
+     * length id makes the one separator unambiguous (the same
+     * arrangement as a file name after its sender in "#FILE#").
+     * Anything else is null: a control text gone wrong, dropped
+     * silently (but still relayed by the hub, like every control
+     * text).
+     */
+    private fun parseEditText(text: String): Pair<String, String>? {
+        if (!text.startsWith(EDIT_PREFIX)) return null
+        val rest = text.substring(EDIT_PREFIX.length)
+        if (rest.length < MESSAGE_ID_LENGTH + 1) return null
+        val target = rest.substring(0, MESSAGE_ID_LENGTH)
+        if (!isMessageIdShape(target)) return null
+        if (rest[MESSAGE_ID_LENGTH] != '#') return null
+        val newText = rest.substring(MESSAGE_ID_LENGTH + 1)
+        if (newText.isEmpty()) return null
+        return target to newText
+    }
+
+    /**
+     * Reads a delete-for-everyone control text: "#DEL#" + target
+     * message id, and nothing else — the id must have the exact
+     * message-id shape, so a typed chat text can never be taken
+     * for a delete. Null for anything else, with the same
+     * drop-silently rule as [parseEditText].
+     */
+    private fun parseDeleteText(text: String): String? {
+        if (!text.startsWith(DELETE_PREFIX)) return null
+        val rest = text.substring(DELETE_PREFIX.length)
+        if (!isMessageIdShape(rest)) return null
+        return rest
     }
 
     /**
@@ -2421,6 +2564,16 @@ class ChatManager(
         // "#REACT#" + target message id + "#" + emoji
         // (see sendReaction / parseReactionText).
         private const val REACT_PREFIX = "#REACT#"
+        // An edit of one of the author's own text messages, packed
+        // inside an ordinary text payload: "#EDIT#" + target
+        // message id + "#" + the new text (see sendEditMessage /
+        // parseEditText).
+        private const val EDIT_PREFIX = "#EDIT#"
+        // A delete-for-everyone of one of the author's own
+        // messages, packed inside an ordinary text payload:
+        // "#DEL#" + target message id (see sendDeleteMessage /
+        // parseDeleteText).
+        private const val DELETE_PREFIX = "#DEL#"
         // Walkie-talkie control texts, packed inside ordinary text
         // payloads like "#LOC#" and "#REACT#" are: "#TALK#START"
         // just before the audio stream opens, "#TALK#END" just

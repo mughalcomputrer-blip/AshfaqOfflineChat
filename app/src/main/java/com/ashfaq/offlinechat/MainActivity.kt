@@ -805,13 +805,18 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
     /**
      * The menu shown when a message is long-pressed: the six reaction
-     * emojis, then "Reply". A message without a wire id (media saved
-     * by an older app version, which announced none) cannot be
-     * reacted to — the other phones would not know which message the
-     * reaction means — so it only offers "Reply".
+     * emojis, then "Reply". Our own messages also offer "Edit" (text
+     * messages only) and "Delete for everyone". A message without a
+     * wire id (media saved by an older app version, which announced
+     * none) cannot be reacted to — the other phones would not know
+     * which message the reaction means — so it only offers "Reply";
+     * for the same reason such a message cannot be edited or deleted
+     * for everyone either. A deleted message is just a placeholder
+     * now and has no menu at all.
      */
     private fun showMessageMenu(message: ChatMessage) {
         if (closing) return
+        if (message.deleted) return
         if (message.wireId == null) {
             AlertDialog.Builder(this)
                 .setItems(arrayOf(getString(R.string.reply))) { _, _ ->
@@ -821,13 +826,21 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             return
         }
         val emojis = ChatManager.REACTION_EMOJIS
-        val items = (emojis + getString(R.string.reply)).toTypedArray()
+        val canEdit = message.isSent && message.type == ChatMessage.Type.TEXT
+        val items = mutableListOf<String>()
+        items.addAll(emojis)
+        items.add(getString(R.string.reply))
+        if (canEdit) items.add(getString(R.string.edit_message))
+        if (message.isSent) items.add(getString(R.string.delete_for_everyone))
         AlertDialog.Builder(this)
-            .setItems(items) { _, which ->
-                if (which < emojis.size) {
-                    applyOwnReaction(message, emojis[which])
-                } else {
-                    setPendingQuote(message)
+            .setItems(items.toTypedArray()) { _, which ->
+                when {
+                    which < emojis.size ->
+                        applyOwnReaction(message, emojis[which])
+                    which == emojis.size -> setPendingQuote(message)
+                    canEdit && which == emojis.size + 1 ->
+                        showEditMessageDialog(message)
+                    else -> confirmDeleteMessage(message)
                 }
             }
             .show()
@@ -867,6 +880,80 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         pendingQuotedSender = null
         pendingQuotedText = null
         quoteBar.visibility = View.GONE
+    }
+
+    // ---------- Edits & deletes ----------
+
+    /**
+     * The Edit flow for one of our own text messages: a dialog with
+     * the current text prefilled (the display-name dialog's shape).
+     * On Save the edit command goes out first — while not connected
+     * nothing changes anywhere and a toast says so — then our own
+     * bubble updates in place and the chat history follows. Saving
+     * the unchanged text, or an empty one, does nothing.
+     */
+    private fun showEditMessageDialog(message: ChatMessage) {
+        val wireId = message.wireId ?: return
+        val input = EditText(this).apply {
+            setText(message.text)
+            setSelection(text.length)
+            hint = getString(R.string.message_hint)
+        }
+        // Give the text field some room inside the dialog.
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val side = (20 * resources.displayMetrics.density).toInt()
+            setPadding(side, 0, side, 0)
+            addView(input)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.edit_message_title)
+            .setView(container)
+            .setPositiveButton(R.string.save) { _, _ ->
+                val newText = input.text.toString().trim()
+                if (newText.isNotEmpty() && newText != message.text) {
+                    if (chatManager.sendEditMessage(wireId, newText)) {
+                        if (adapter.editOwnMessage(wireId, newText)) {
+                            ChatHistoryStore.save(this, adapter.snapshot())
+                        }
+                    } else {
+                        Toast.makeText(
+                            this, R.string.not_connected_edit,
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * The Delete-for-everyone flow for one of our own messages:
+     * asks first, then the command goes out and our own bubble
+     * becomes the deleted placeholder, like it does on the other
+     * phones (the history follows). While not connected nothing
+     * changes and a toast says so.
+     */
+    private fun confirmDeleteMessage(message: ChatMessage) {
+        val wireId = message.wireId ?: return
+        AlertDialog.Builder(this)
+            .setTitle(R.string.delete_message_title)
+            .setMessage(R.string.delete_message_text)
+            .setPositiveButton(R.string.delete_message_confirm) { _, _ ->
+                if (chatManager.sendDeleteMessage(wireId)) {
+                    if (adapter.deleteOwnMessage(wireId)) {
+                        ChatHistoryStore.save(this, adapter.snapshot())
+                    }
+                } else {
+                    Toast.makeText(
+                        this, R.string.not_connected_delete,
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     // ---------- Chat search ----------
@@ -1975,6 +2062,29 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         // more) is dropped by the adapter the same way.
         val reactor = reactorName?.takeIf { it.isNotBlank() } ?: return
         if (adapter.applyReaction(targetWireId, emoji, reactor)) {
+            ChatHistoryStore.save(this, adapter.snapshot())
+        }
+    }
+
+    override fun onMessageEdited(
+        targetWireId: String,
+        newText: String,
+        editorName: String?
+    ) {
+        if (closing) return
+        // The adapter applies the edit only when the stamped name is
+        // the message's author; an edit for a message this phone
+        // does not have, or from anybody else, changes nothing.
+        if (adapter.applyEdit(targetWireId, newText, editorName)) {
+            ChatHistoryStore.save(this, adapter.snapshot())
+        }
+    }
+
+    override fun onMessageDeleted(targetWireId: String, deleterName: String?) {
+        if (closing) return
+        // Same authorship rule as for an edit; the adapter also
+        // removes the message's media file from this phone.
+        if (adapter.applyDelete(targetWireId, deleterName)) {
             ChatHistoryStore.save(this, adapter.snapshot())
         }
     }
