@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.ImageDecoder
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Typeface
@@ -2959,18 +2960,97 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     }
 
     /**
-     * Loads a picked photo for use as the profile picture: bounds
-     * first, a sampled decode, the EXIF turn, a centre-crop to a
-     * square, and a shrink to [PROFILE_PHOTO_STORE_SIZE] — the
-     * chat-photo preparation's shape, minus the file writing (the
-     * caller decides where the bitmap goes). Null when the pick
-     * cannot be read as a picture at all.
+     * Loads a picked photo for use as the profile picture: the
+     * pick is copied into our own cache file first and decoded
+     * from there (see [decodeProfileBitmap]), then centre-cropped
+     * to a square and shrunk to [PROFILE_PHOTO_STORE_SIZE]. The
+     * copy matters: some gallery photos cannot be decoded straight
+     * from the picker's Uri at all — HEIC shots taken on other
+     * phones are the common case — and some picker Uris cannot be
+     * re-opened for the several reads a decode needs. Null when
+     * the pick cannot be read as a picture at all.
      */
     private fun createProfilePhotoBitmap(uri: Uri): Bitmap? {
+        val local = File(
+            cacheDir, "profile_pick_${System.currentTimeMillis()}.img"
+        )
+        val copied = try {
+            contentResolver.openInputStream(uri)?.use { input ->
+                local.outputStream().use { output -> input.copyTo(output) }
+            } != null && local.exists() && local.length() > 0L
+        } catch (e: Exception) {
+            false
+        }
+        if (!copied) {
+            local.delete()
+            return null
+        }
+        try {
+            var bitmap = decodeProfileBitmap(local) ?: return null
+
+            val side = minOf(bitmap.width, bitmap.height)
+            val square = Bitmap.createBitmap(
+                bitmap,
+                (bitmap.width - side) / 2,
+                (bitmap.height - side) / 2,
+                side,
+                side
+            )
+            if (square !== bitmap) {
+                bitmap.recycle()
+                bitmap = square
+            }
+            if (side > PROFILE_PHOTO_STORE_SIZE) {
+                val scaled = Bitmap.createScaledBitmap(
+                    bitmap,
+                    PROFILE_PHOTO_STORE_SIZE,
+                    PROFILE_PHOTO_STORE_SIZE,
+                    true
+                )
+                if (scaled !== bitmap) {
+                    bitmap.recycle()
+                    bitmap = scaled
+                }
+            }
+            return bitmap
+        } finally {
+            local.delete()
+        }
+    }
+
+    /**
+     * Decodes a local image file into an upright bitmap no larger
+     * than twice the stored profile size. On Android 9 and newer
+     * ImageDecoder does the work: it reads formats BitmapFactory
+     * cannot (HEIC/HEIF from other phones' cameras above all) and
+     * applies the photo's EXIF turn itself. Older phones — and
+     * anything ImageDecoder still refuses — fall back to
+     * BitmapFactory with a sampled decode and the EXIF turn done
+     * by hand, the way the chat photos are prepared.
+     */
+    private fun decodeProfileBitmap(file: File): Bitmap? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                val source = ImageDecoder.createSource(file)
+                return ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    val limit = PROFILE_PHOTO_STORE_SIZE * 2
+                    val largest = maxOf(info.size.width, info.size.height)
+                    if (largest > limit) {
+                        val scale = limit.toFloat() / largest
+                        decoder.setTargetSize(
+                            (info.size.width * scale).toInt().coerceAtLeast(1),
+                            (info.size.height * scale).toInt().coerceAtLeast(1)
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                // Not decodable this way; BitmapFactory below
+                // gets its chance before the pick is given up on.
+            }
+        }
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        contentResolver.openInputStream(uri)?.use { input ->
-            BitmapFactory.decodeStream(input, null, bounds)
-        } ?: return null
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
         val decodeOptions = BitmapFactory.Options().apply {
@@ -2979,11 +3059,29 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 PROFILE_PHOTO_STORE_SIZE * 2, PROFILE_PHOTO_STORE_SIZE * 2
             )
         }
-        var bitmap = contentResolver.openInputStream(uri)?.use { input ->
-            BitmapFactory.decodeStream(input, null, decodeOptions)
-        } ?: return null
+        var bitmap = BitmapFactory.decodeFile(file.absolutePath, decodeOptions)
+            ?: return null
 
-        val rotationDegrees = readExifRotationDegrees(uri)
+        val rotationDegrees =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                try {
+                    when (
+                        ExifInterface(file.absolutePath).getAttributeInt(
+                            ExifInterface.TAG_ORIENTATION,
+                            ExifInterface.ORIENTATION_NORMAL
+                        )
+                    ) {
+                        ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                        ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                        ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                        else -> 0
+                    }
+                } catch (e: Exception) {
+                    0
+                }
+            } else {
+                0
+            }
         if (rotationDegrees != 0) {
             val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
             val rotated = Bitmap.createBitmap(
@@ -2992,31 +3090,6 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             if (rotated !== bitmap) {
                 bitmap.recycle()
                 bitmap = rotated
-            }
-        }
-
-        val side = minOf(bitmap.width, bitmap.height)
-        val square = Bitmap.createBitmap(
-            bitmap,
-            (bitmap.width - side) / 2,
-            (bitmap.height - side) / 2,
-            side,
-            side
-        )
-        if (square !== bitmap) {
-            bitmap.recycle()
-            bitmap = square
-        }
-        if (side > PROFILE_PHOTO_STORE_SIZE) {
-            val scaled = Bitmap.createScaledBitmap(
-                bitmap,
-                PROFILE_PHOTO_STORE_SIZE,
-                PROFILE_PHOTO_STORE_SIZE,
-                true
-            )
-            if (scaled !== bitmap) {
-                bitmap.recycle()
-                bitmap = scaled
             }
         }
         return bitmap
