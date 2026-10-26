@@ -56,6 +56,12 @@
 <string name="message_edited">edited</string>
 <string name="not_connected_edit">Not connected. Message not edited.</string>
 <string name="not_connected_delete">Not connected. Message not deleted.</string>
+<string name="forward">Forward</string>
+<string name="forward_message_title">Forward message?</string>
+<string name="forward_message_text">This message will be sent again, marked as forwarded.</string>
+<string name="message_forwarded">↪ Forwarded</string>
+<string name="message_forwarded_from">↪ Forwarded · from %1$s</string>
+<string name="not_connected_forward">Not connected. Message not forwarded.</string>
 <string name="quote_friend">Friend</string>
 <string name="quote_voice_preview">🎙 Voice message (%1$s)</string>
 <string name="quote_photo_preview">📷 Photo</string>

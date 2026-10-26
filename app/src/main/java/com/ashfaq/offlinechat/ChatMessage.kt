@@ -65,7 +65,20 @@ data class ChatMessage(
     // and history positions around it stay sane; its own reactions
     // are cleared and (on the phones that received it) its media
     // file is deleted. Our own copy is marked exactly the same way.
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    // True when this message is a forward: a fresh copy of an
+    // earlier message, re-sent by the person who forwarded it (the
+    // bubble then shows a small "↪ Forwarded" caption). A forward
+    // is a new message in every other respect — new wire id, no
+    // quote, no reactions carried over.
+    val forwarded: Boolean = false,
+    // Who originally wrote the forwarded message, when that is
+    // someone other than the phone that sent this copy (forwarding
+    // a message you received). Shown in the caption as
+    // "↪ Forwarded · from <name>". Null when the forwarder is the
+    // author (forwarding your own message) or the author is
+    // unknown; the caption is then just "↪ Forwarded".
+    val forwardedFrom: String? = null
 ) {
     enum class Type { TEXT, VOICE, PHOTO, FILE, VIDEO, LOCATION }
 }

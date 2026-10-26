@@ -63,6 +63,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     class MessageViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val bubble: View = view.findViewById(R.id.bubbleView)
         val senderNameText: TextView = view.findViewById(R.id.senderNameText)
+        val forwardedText: TextView = view.findViewById(R.id.forwardedText)
         val quoteBlock: View = view.findViewById(R.id.quoteBlock)
         val quoteStrip: View = view.findViewById(R.id.quoteStrip)
         val quoteSenderText: TextView = view.findViewById(R.id.quoteSenderText)
@@ -138,6 +139,26 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.editedText.visibility = View.GONE
         }
 
+        // The "↪ Forwarded" caption at the top of the bubble, on a
+        // message that is a forward of an earlier one; it names the
+        // original author when that was somebody other than the
+        // phone that sent this copy. A deleted message is a
+        // placeholder now and shows no caption either.
+        if (message.forwarded && !message.deleted) {
+            holder.forwardedText.visibility = View.VISIBLE
+            holder.forwardedText.text =
+                if (!message.forwardedFrom.isNullOrBlank()) {
+                    context.getString(
+                        R.string.message_forwarded_from, message.forwardedFrom
+                    )
+                } else {
+                    context.getString(R.string.message_forwarded)
+                }
+        } else {
+            holder.forwardedText.visibility = View.GONE
+            holder.forwardedText.text = null
+        }
+
         // In a group, a received message shows who originally sent it.
         // Our own messages (and nameless ones from older versions) don't.
         val senderName = message.senderName
@@ -160,6 +181,9 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 ContextCompat.getColor(context, R.color.bubble_sent_text)
             )
             holder.editedText.setTextColor(
+                ContextCompat.getColor(context, R.color.bubble_sent_text)
+            )
+            holder.forwardedText.setTextColor(
                 ContextCompat.getColor(context, R.color.bubble_sent_text)
             )
             holder.durationText.setTextColor(
@@ -192,6 +216,7 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             holder.messageText.setTextColor(AppColors.bubbleReceivedText(context))
             holder.timeText.setTextColor(AppColors.textSecondary(context))
             holder.editedText.setTextColor(AppColors.textSecondary(context))
+            holder.forwardedText.setTextColor(AppColors.textSecondary(context))
             holder.durationText.setTextColor(AppColors.bubbleReceivedText(context))
             holder.buttonPlay.setColorFilter(AppColors.accent(context))
             holder.fileNameText.setTextColor(AppColors.bubbleReceivedText(context))

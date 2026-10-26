@@ -108,6 +108,11 @@ object ChatHistoryStore {
             // the exact shape they always had.
             if (message.edited) item.put("edited", true)
             if (message.deleted) item.put("deleted", true)
+            // Whether the message is a forward, and who originally
+            // wrote it when that was someone else. Only written for
+            // forwards, like the flags above.
+            if (message.forwarded) item.put("forwarded", true)
+            message.forwardedFrom?.let { item.put("forwardedFrom", it) }
             // The reactions on the message: emoji -> the names of the
             // people who reacted with it. Only written when non-empty.
             if (message.reactions.isNotEmpty()) {
@@ -197,8 +202,17 @@ object ChatHistoryStore {
         // those own messages then honestly show the single "sent" tick.
         // They have no "edited"/"deleted" keys either; both default
         // to false, so old messages load exactly as they were saved.
+        // The same goes for the forward keys: no "forwarded" key
+        // means not a forward, and no "forwardedFrom" key means the
+        // caption names nobody.
         val edited = item.optBoolean("edited", false)
         val deleted = item.optBoolean("deleted", false)
+        val forwarded = item.optBoolean("forwarded", false)
+        val forwardedFrom = if (item.isNull("forwardedFrom")) {
+            null
+        } else {
+            item.optString("forwardedFrom").takeIf { it.isNotEmpty() }
+        }
         // A voice, photo, video or file entry is only useful while its
         // file is still there; sent files lived in the cache and may be
         // gone by now. A DELETED entry is the exception: its file was
@@ -240,7 +254,9 @@ object ChatHistoryStore {
             wireId = wireId,
             reactions = reactions,
             edited = edited,
-            deleted = deleted
+            deleted = deleted,
+            forwarded = forwarded,
+            forwardedFrom = forwardedFrom
         )
     }
 }

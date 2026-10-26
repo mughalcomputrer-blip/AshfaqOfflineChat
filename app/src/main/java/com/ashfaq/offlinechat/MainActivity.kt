@@ -934,22 +934,32 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
     /**
      * The menu shown when a message is long-pressed: the six reaction
-     * emojis, then "Reply". Our own messages also offer "Edit" (text
-     * messages only) and "Delete for everyone". A message without a
-     * wire id (media saved by an older app version, which announced
-     * none) cannot be reacted to — the other phones would not know
-     * which message the reaction means — so it only offers "Reply";
-     * for the same reason such a message cannot be edited or deleted
-     * for everyone either. A deleted message is just a placeholder
-     * now and has no menu at all.
+     * emojis, then "Reply" and "Forward". Our own messages also offer
+     * "Edit" (text messages only) and "Delete for everyone". A message
+     * without a wire id (media saved by an older app version, which
+     * announced none) cannot be reacted to — the other phones would not
+     * know which message the reaction means — so it only offers "Reply"
+     * and "Forward"; for the same reason such a message cannot be
+     * edited or deleted for everyone either (a forward needs no id:
+     * the copy is a new message with a new id of its own). A deleted
+     * message is just a placeholder now and has no menu at all.
      */
     private fun showMessageMenu(message: ChatMessage) {
         if (closing) return
         if (message.deleted) return
         if (message.wireId == null) {
             AlertDialog.Builder(this)
-                .setItems(arrayOf(getString(R.string.reply))) { _, _ ->
-                    setPendingQuote(message)
+                .setItems(
+                    arrayOf(
+                        getString(R.string.reply),
+                        getString(R.string.forward)
+                    )
+                ) { _, which ->
+                    if (which == 0) {
+                        setPendingQuote(message)
+                    } else {
+                        confirmForwardMessage(message)
+                    }
                 }
                 .show()
             return
@@ -959,6 +969,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         val items = mutableListOf<String>()
         items.addAll(emojis)
         items.add(getString(R.string.reply))
+        items.add(getString(R.string.forward))
         if (canEdit) items.add(getString(R.string.edit_message))
         if (message.isSent) items.add(getString(R.string.delete_for_everyone))
         AlertDialog.Builder(this)
@@ -967,7 +978,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                     which < emojis.size ->
                         applyOwnReaction(message, emojis[which])
                     which == emojis.size -> setPendingQuote(message)
-                    canEdit && which == emojis.size + 1 ->
+                    which == emojis.size + 1 ->
+                        confirmForwardMessage(message)
+                    canEdit && which == emojis.size + 2 ->
                         showEditMessageDialog(message)
                     else -> confirmDeleteMessage(message)
                 }
@@ -1083,6 +1096,267 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
+    }
+
+    // ---------- Forwarding ----------
+
+    /**
+     * The Forward flow for any message that is not deleted: asks
+     * first, then the message goes out again as a new message from
+     * this phone, marked as forwarded (see [forwardMessage]).
+     */
+    private fun confirmForwardMessage(message: ChatMessage) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.forward_message_title)
+            .setMessage(R.string.forward_message_text)
+            .setPositiveButton(R.string.forward) { _, _ ->
+                forwardMessage(message)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * Who a forward of [message] names as the original author: the
+     * author a forward of it already names (so forwarding a forward
+     * keeps pointing at the person who wrote it first); for a
+     * message we received, its sender; for our own message, nobody
+     * — we are the author, and the caption is then just
+     * "↪ Forwarded".
+     */
+    private fun forwardAuthorOf(message: ChatMessage): String? =
+        message.forwardedFrom
+            ?: if (message.isSent) {
+                null
+            } else {
+                message.senderName?.takeIf { it.isNotBlank() }
+            }
+
+    /**
+     * Sends [message] again as a new message from this phone,
+     * marked as a forward. The copy is fresh in every respect: a
+     * new local id and wire id, no quote (a pending reply is left
+     * untouched — it belongs to the next composed message), no
+     * reactions. While not connected nothing is sent and a toast
+     * says so. A media message whose file is no longer on this
+     * phone cannot be forwarded and says so instead.
+     */
+    private fun forwardMessage(message: ChatMessage) {
+        val author = forwardAuthorOf(message)
+        val localId = nextLocalId++
+        val wireId = UUID.randomUUID().toString()
+        when (message.type) {
+            ChatMessage.Type.TEXT -> {
+                if (!chatManager.sendForwardedText(
+                        message.text, author, localId, wireId
+                    )
+                ) {
+                    toastNotConnectedForward()
+                    return
+                }
+                addMessage(
+                    ChatMessage(
+                        text = message.text,
+                        isSent = true,
+                        localId = localId,
+                        wireId = wireId,
+                        forwarded = true,
+                        forwardedFrom = author
+                    )
+                )
+            }
+            ChatMessage.Type.LOCATION -> {
+                val latitude = message.latitude
+                val longitude = message.longitude
+                if (latitude == null || longitude == null) return
+                if (!chatManager.sendForwardedLocation(
+                        latitude, longitude, author, localId, wireId
+                    )
+                ) {
+                    toastNotConnectedForward()
+                    return
+                }
+                addMessage(
+                    ChatMessage(
+                        text = "",
+                        isSent = true,
+                        type = ChatMessage.Type.LOCATION,
+                        latitude = latitude,
+                        longitude = longitude,
+                        localId = localId,
+                        wireId = wireId,
+                        forwarded = true,
+                        forwardedFrom = author
+                    )
+                )
+            }
+            ChatMessage.Type.VOICE -> {
+                val copy = mediaCopyForForward(message.audioPath) ?: return
+                if (!chatManager.sendVoiceMessage(
+                        copy, message.durationSeconds, localId,
+                        wireId = wireId,
+                        forwarded = true, forwardedFrom = author
+                    )
+                ) {
+                    toastNotConnectedForward()
+                    return
+                }
+                addMessage(
+                    ChatMessage(
+                        text = "",
+                        isSent = true,
+                        type = ChatMessage.Type.VOICE,
+                        audioPath = copy.absolutePath,
+                        durationSeconds = message.durationSeconds,
+                        localId = localId,
+                        wireId = wireId,
+                        forwarded = true,
+                        forwardedFrom = author
+                    )
+                )
+            }
+            ChatMessage.Type.PHOTO -> {
+                val copy = mediaCopyForForward(message.imagePath) ?: return
+                if (!chatManager.sendPhotoMessage(
+                        copy, localId,
+                        wireId = wireId,
+                        forwarded = true, forwardedFrom = author
+                    )
+                ) {
+                    toastNotConnectedForward()
+                    return
+                }
+                addMessage(
+                    ChatMessage(
+                        text = "",
+                        isSent = true,
+                        type = ChatMessage.Type.PHOTO,
+                        imagePath = copy.absolutePath,
+                        localId = localId,
+                        wireId = wireId,
+                        forwarded = true,
+                        forwardedFrom = author
+                    )
+                )
+            }
+            ChatMessage.Type.VIDEO -> {
+                val copy = mediaCopyForForward(message.videoPath) ?: return
+                if (!chatManager.sendVideoMessage(
+                        copy, localId,
+                        wireId = wireId,
+                        forwarded = true, forwardedFrom = author
+                    )
+                ) {
+                    toastNotConnectedForward()
+                    return
+                }
+                addMessage(
+                    ChatMessage(
+                        text = "",
+                        isSent = true,
+                        type = ChatMessage.Type.VIDEO,
+                        videoPath = copy.absolutePath,
+                        durationSeconds = message.durationSeconds,
+                        localId = localId,
+                        wireId = wireId,
+                        forwarded = true,
+                        forwardedFrom = author
+                    )
+                )
+            }
+            ChatMessage.Type.FILE -> {
+                val copy = mediaCopyForForward(message.filePath) ?: return
+                if (!chatManager.sendFileMessage(
+                        copy, localId,
+                        wireId = wireId,
+                        forwarded = true, forwardedFrom = author
+                    )
+                ) {
+                    toastNotConnectedForward()
+                    return
+                }
+                addMessage(
+                    ChatMessage(
+                        text = "",
+                        isSent = true,
+                        type = ChatMessage.Type.FILE,
+                        filePath = copy.absolutePath,
+                        fileName = copy.name,
+                        fileSizeBytes = copy.length(),
+                        localId = localId,
+                        wireId = wireId,
+                        forwarded = true,
+                        forwardedFrom = author
+                    )
+                )
+            }
+        }
+    }
+
+    /** The toast every failed forward shows: nothing was sent. */
+    private fun toastNotConnectedForward() {
+        Toast.makeText(
+            this, R.string.not_connected_forward, Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    /**
+     * The file a media forward sends: our own sends keep their
+     * files in the cache folder, and a forward is a new send, so
+     * it gets its own cache copy of the file it re-sends — the
+     * forwarded row then stands on its own, even if the original
+     * message is later deleted (which removes the original's
+     * file). A file that is already in the cache folder (one of
+     * our own earlier sends) is used as it is. Null — with the
+     * "file gone" toast shown — when the file is no longer on
+     * this phone or the copy fails.
+     */
+    private fun mediaCopyForForward(path: String?): File? {
+        val source = path?.let { File(it) }
+        if (source == null || !source.exists() || source.length() == 0L) {
+            Toast.makeText(this, R.string.file_gone, Toast.LENGTH_SHORT).show()
+            return null
+        }
+        if (source.absoluteFile.parentFile?.absolutePath ==
+            cacheDir.absolutePath
+        ) {
+            return source
+        }
+        val dest = uniqueCacheFile(source.name)
+        val copy = try {
+            source.copyTo(dest, overwrite = false)
+            dest.takeIf { it.exists() && it.length() > 0 }
+        } catch (e: Exception) {
+            null
+        }
+        if (copy == null) {
+            try {
+                dest.delete()
+            } catch (ignored: Exception) {
+                // A half copy that will not delete is harmless.
+            }
+            Toast.makeText(this, R.string.file_gone, Toast.LENGTH_SHORT).show()
+        }
+        return copy
+    }
+
+    /**
+     * A free file name in the cache folder: the name itself, or
+     * "name (1)", "name (2)", ... — the same rule the received
+     * files follow, so a forward never overwrites another file.
+     */
+    private fun uniqueCacheFile(name: String): File {
+        var candidate = File(cacheDir, name)
+        if (!candidate.exists()) return candidate
+        val dot = name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val extension = if (dot > 0) name.substring(dot) else ""
+        var counter = 1
+        while (candidate.exists()) {
+            candidate = File(cacheDir, "$base ($counter)$extension")
+            counter++
+        }
+        return candidate
     }
 
     // ---------- Chat search ----------
@@ -2186,7 +2460,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         senderName: String?,
         quotedSender: String?,
         quotedText: String?,
-        wireId: String?
+        wireId: String?,
+        forwarded: Boolean,
+        forwardedFrom: String?
     ) {
         if (closing) return
         addMessage(
@@ -2196,7 +2472,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 senderName = senderName,
                 quotedSender = quotedSender,
                 quotedText = quotedText,
-                wireId = wireId
+                wireId = wireId,
+                forwarded = forwarded,
+                forwardedFrom = forwardedFrom
             )
         )
     }
@@ -2254,7 +2532,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         senderName: String?,
         quotedSender: String?,
         quotedText: String?,
-        wireId: String?
+        wireId: String?,
+        forwarded: Boolean,
+        forwardedFrom: String?
     ) {
         if (closing) return
         addMessage(
@@ -2267,7 +2547,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 senderName = senderName,
                 quotedSender = quotedSender,
                 quotedText = quotedText,
-                wireId = wireId
+                wireId = wireId,
+                forwarded = forwarded,
+                forwardedFrom = forwardedFrom
             )
         )
     }
@@ -2277,7 +2559,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         senderName: String?,
         quotedSender: String?,
         quotedText: String?,
-        wireId: String?
+        wireId: String?,
+        forwarded: Boolean,
+        forwardedFrom: String?
     ) {
         if (closing) return
         addMessage(
@@ -2289,7 +2573,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 senderName = senderName,
                 quotedSender = quotedSender,
                 quotedText = quotedText,
-                wireId = wireId
+                wireId = wireId,
+                forwarded = forwarded,
+                forwardedFrom = forwardedFrom
             )
         )
     }
@@ -2300,7 +2586,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         senderName: String?,
         quotedSender: String?,
         quotedText: String?,
-        wireId: String?
+        wireId: String?,
+        forwarded: Boolean,
+        forwardedFrom: String?
     ) {
         if (closing) return
         addMessage(
@@ -2313,7 +2601,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 senderName = senderName,
                 quotedSender = quotedSender,
                 quotedText = quotedText,
-                wireId = wireId
+                wireId = wireId,
+                forwarded = forwarded,
+                forwardedFrom = forwardedFrom
             )
         )
     }
@@ -2325,7 +2615,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         senderName: String?,
         quotedSender: String?,
         quotedText: String?,
-        wireId: String?
+        wireId: String?,
+        forwarded: Boolean,
+        forwardedFrom: String?
     ) {
         if (closing) return
         addMessage(
@@ -2339,7 +2631,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 senderName = senderName,
                 quotedSender = quotedSender,
                 quotedText = quotedText,
-                wireId = wireId
+                wireId = wireId,
+                forwarded = forwarded,
+                forwardedFrom = forwardedFrom
             )
         )
     }
@@ -2348,7 +2642,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         latitude: Double,
         longitude: Double,
         senderName: String?,
-        wireId: String?
+        wireId: String?,
+        forwarded: Boolean,
+        forwardedFrom: String?
     ) {
         if (closing) return
         addMessage(
@@ -2359,7 +2655,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 latitude = latitude,
                 longitude = longitude,
                 senderName = senderName,
-                wireId = wireId
+                wireId = wireId,
+                forwarded = forwarded,
+                forwardedFrom = forwardedFrom
             )
         )
     }

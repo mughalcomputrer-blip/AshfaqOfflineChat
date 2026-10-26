@@ -122,6 +122,27 @@ import java.util.UUID
  * names the typer, not the hub. A lost signal costs nothing:
  * the receiving side forgets a typer a few seconds after their
  * last signal, stop or no stop.
+ *
+ * Forwarding: there is only ever one conversation on a phone, so
+ * "forward" means re-sending an earlier message as a NEW message
+ * from the person forwarding it, labelled as forwarded. A text
+ * forward prefixes the text with "#FWD#" + the original author's
+ * name + "#" (the name empty when the forwarder is the author);
+ * a forwarded location packs its "#LOC#" text after the same
+ * prefix. Both ride [sendMessage], so they get a fresh message
+ * id, the forwarder's "#FROM#" name, the delivered ticks and the
+ * hub's word-for-word relay like any text, and are recognised
+ * here after unpacking. A media forward re-sends the file
+ * through the ordinary media send, with the flag appended to
+ * the "#MID#" text instead: "#MID#" + id + "#FWD#" + the
+ * original author's name. It rides there because an older app
+ * version reads a "#MID#" text as exactly an id and drops one
+ * that does not parse whole — a forwarded file therefore still
+ * arrives there (only without its id), while the info texts
+ * themselves ("#PHOTO#" and friends) cannot carry an extra
+ * segment safely (a photo's name must end in ".jpg", a file's
+ * name would swallow the segment). A forward never carries the
+ * original's quote or reactions: it starts life clean.
  */
 class ChatManager(
     context: Context,
@@ -153,26 +174,36 @@ class ChatManager(
          * [wireId] is the id other phones know this message by (its
          * "#ID#" uuid), which reactions refer to; null only for
          * payloads from very old app versions that carried no id.
+         * [forwarded] says the message is a forward — a fresh copy
+         * of an earlier message, sent by [senderName] — and
+         * [forwardedFrom] is who wrote the original when that was
+         * somebody else (null when the forwarder is the author or
+         * the author is unknown).
          */
         fun onMessageReceived(
             text: String,
             senderName: String?,
             quotedSender: String?,
             quotedText: String?,
-            wireId: String?
+            wireId: String?,
+            forwarded: Boolean = false,
+            forwardedFrom: String? = null
         )
 
         /**
          * A shared position arrived. [senderName] is who sent it
          * (null if unknown), like for a text message. [wireId] is
          * the id other phones know the position's message by, like
-         * for a text message.
+         * for a text message. [forwarded]/[forwardedFrom] are as
+         * for [onMessageReceived].
          */
         fun onLocationMessageReceived(
             latitude: Double,
             longitude: Double,
             senderName: String?,
-            wireId: String?
+            wireId: String?,
+            forwarded: Boolean = false,
+            forwardedFrom: String? = null
         ) {}
 
         /**
@@ -279,7 +310,9 @@ class ChatManager(
          * A voice message arrived; [filePath] points to our own copy
          * of it. [wireId] is the id the sender announced for it in a
          * "#MID#" text (null when the sender's app version announced
-         * none), which reactions refer to.
+         * none), which reactions refer to. [forwarded] and
+         * [forwardedFrom] are as for [onMessageReceived] (for media
+         * they were announced in the same "#MID#" text).
          */
         fun onVoiceMessageReceived(
             filePath: String,
@@ -287,7 +320,9 @@ class ChatManager(
             senderName: String?,
             quotedSender: String?,
             quotedText: String?,
-            wireId: String?
+            wireId: String?,
+            forwarded: Boolean = false,
+            forwardedFrom: String? = null
         ) {}
 
         /** A photo arrived; [filePath] points to our own copy of it.
@@ -297,7 +332,9 @@ class ChatManager(
             senderName: String?,
             quotedSender: String?,
             quotedText: String?,
-            wireId: String?
+            wireId: String?,
+            forwarded: Boolean = false,
+            forwardedFrom: String? = null
         ) {}
 
         /** A video arrived; [filePath] points to our own copy of it.
@@ -308,7 +345,9 @@ class ChatManager(
             senderName: String?,
             quotedSender: String?,
             quotedText: String?,
-            wireId: String?
+            wireId: String?,
+            forwarded: Boolean = false,
+            forwardedFrom: String? = null
         ) {}
 
         /**
@@ -323,7 +362,9 @@ class ChatManager(
             senderName: String?,
             quotedSender: String?,
             quotedText: String?,
-            wireId: String?
+            wireId: String?,
+            forwarded: Boolean = false,
+            forwardedFrom: String? = null
         ) {}
     }
 
@@ -494,14 +535,21 @@ class ChatManager(
     private data class PendingQuote(val sender: String, val text: String)
     private val pendingQuotes = mutableMapOf<String, PendingQuote>()
 
-    // The id a phone announced (in a small "#MID#" text) for the
-    // voice, photo, video or file it is about to send, so reactions
-    // can refer to that message later. Kept per sending endpoint and
-    // cleaned up exactly like [pendingQuotes]: used when the file's
-    // transfer finishes, dropped with the file info when the transfer
-    // fails or the phone leaves. A file that arrives with no "#MID#"
-    // (an older app version) simply has no id here.
-    private val pendingWireIds = mutableMapOf<String, String>()
+    // What a phone announced (in a small "#MID#" text) for the
+    // voice, photo, video or file it is about to send: the id
+    // reactions can refer to that message by later, and whether the
+    // message is a forward of an earlier one (and whose). Kept per
+    // sending endpoint and cleaned up exactly like [pendingQuotes]:
+    // used when the file's transfer finishes, dropped with the file
+    // info when the transfer fails or the phone leaves. A file that
+    // arrives with no "#MID#" (an older app version) simply has no
+    // entry here.
+    private data class PendingMediaInfo(
+        val wireId: String,
+        val forwarded: Boolean,
+        val forwardedFrom: String?
+    )
+    private val pendingMediaInfos = mutableMapOf<String, PendingMediaInfo>()
 
     // ----- Walkie-talkie state (see the class comment) -----
 
@@ -765,6 +813,66 @@ class ChatManager(
     fun sendDeleteMessage(targetWireId: String): Boolean {
         if (targetWireId.isEmpty()) return false
         return sendMessage(DELETE_PREFIX + targetWireId)
+    }
+
+    /**
+     * The prefix a forwarded text or location carries: "#FWD#" +
+     * the original author's name + "#". The name goes through
+     * [wireQuoteField], so it can never contain the '#' separator;
+     * it is empty when the forwarder is the author (or the author
+     * is unknown), which the reading side reports as a forward
+     * with no name. Read back by [parseForwardText].
+     */
+    private fun forwardPrefix(forwardedFrom: String?): String =
+        FORWARD_PREFIX +
+            wireQuoteField(forwardedFrom ?: "", MAX_SENDER_NAME_LENGTH) + "#"
+
+    /**
+     * Forwards a text message: [text] is sent again as a new
+     * message from this phone, labelled as a forward of the
+     * message [forwardedFrom] originally wrote (null when that
+     * was this phone, or the author is unknown). The text rides
+     * the ordinary text path ([sendMessage]) behind the forward
+     * prefix, so the copy gets a fresh message id, this phone's
+     * name as its sender, the delivered ticks ([localId] and
+     * [wireId] work exactly as for a typed message) and the hub's
+     * word-for-word relay; the receiving side recognises the
+     * prefix in [parseForwardText] and shows the text with the
+     * "↪ Forwarded" caption. No quote and no reactions are
+     * carried over: the copy starts life clean.
+     */
+    fun sendForwardedText(
+        text: String,
+        forwardedFrom: String?,
+        localId: Long = 0,
+        wireId: String? = null
+    ): Boolean {
+        if (text.isEmpty()) return false
+        return sendMessage(
+            forwardPrefix(forwardedFrom) + text, localId, wireId = wireId
+        )
+    }
+
+    /**
+     * Forwards a shared position: the "#LOC#" text a position
+     * normally rides in, packed behind the forward prefix (see
+     * [sendForwardedText]) and sent through the ordinary text
+     * path, so the copy is a new location message from this
+     * phone, flagged as a forward; the receiving side strips
+     * the prefix and reads the position inside it.
+     */
+    fun sendForwardedLocation(
+        latitude: Double,
+        longitude: Double,
+        forwardedFrom: String?,
+        localId: Long = 0,
+        wireId: String? = null
+    ): Boolean {
+        val body = LOCATION_PREFIX +
+            String.format(Locale.US, "%.6f,%.6f", latitude, longitude)
+        return sendMessage(
+            forwardPrefix(forwardedFrom) + body, localId, wireId = wireId
+        )
     }
 
     /**
@@ -1312,7 +1420,9 @@ class ChatManager(
         localId: Long = 0,
         quotedSender: String? = null,
         quotedText: String? = null,
-        wireId: String? = null
+        wireId: String? = null,
+        forwarded: Boolean = false,
+        forwardedFrom: String? = null
     ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
@@ -1326,7 +1436,7 @@ class ChatManager(
             targets, info, file,
             "The voice message could not be sent.", localId,
             replyInfo(quotedSender, quotedText),
-            messageIdText(wireId)
+            messageIdText(wireId, forwarded, forwardedFrom)
         )
     }
 
@@ -1340,7 +1450,9 @@ class ChatManager(
         localId: Long = 0,
         quotedSender: String? = null,
         quotedText: String? = null,
-        wireId: String? = null
+        wireId: String? = null,
+        forwarded: Boolean = false,
+        forwardedFrom: String? = null
     ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
@@ -1354,7 +1466,7 @@ class ChatManager(
             targets, info, file,
             "The photo could not be sent.", localId,
             replyInfo(quotedSender, quotedText),
-            messageIdText(wireId)
+            messageIdText(wireId, forwarded, forwardedFrom)
         )
     }
 
@@ -1371,7 +1483,9 @@ class ChatManager(
         localId: Long = 0,
         quotedSender: String? = null,
         quotedText: String? = null,
-        wireId: String? = null
+        wireId: String? = null,
+        forwarded: Boolean = false,
+        forwardedFrom: String? = null
     ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
@@ -1385,7 +1499,7 @@ class ChatManager(
             targets, info, file,
             "The video could not be sent.", localId,
             replyInfo(quotedSender, quotedText),
-            messageIdText(wireId)
+            messageIdText(wireId, forwarded, forwardedFrom)
         )
     }
 
@@ -1401,7 +1515,9 @@ class ChatManager(
         localId: Long = 0,
         quotedSender: String? = null,
         quotedText: String? = null,
-        wireId: String? = null
+        wireId: String? = null,
+        forwarded: Boolean = false,
+        forwardedFrom: String? = null
     ): Boolean {
         val targets = sendTargets()
         if (targets.isEmpty()) return false
@@ -1415,19 +1531,37 @@ class ChatManager(
             targets, info, file,
             "The file could not be sent.", localId,
             replyInfo(quotedSender, quotedText),
-            messageIdText(wireId)
+            messageIdText(wireId, forwarded, forwardedFrom)
         )
     }
 
     /**
      * The tiny message-id text sent just before a voice, photo, video
      * or file send: "#MID#" + the id the other phones will know this
-     * message by (so reactions can refer to it). Null when the send
-     * carries no id — the host's relays always re-announce the
-     * original id, so relayed files keep theirs.
+     * message by (so reactions can refer to it). When the message is
+     * a forward, "#FWD#" and the original author's name are appended
+     * (the name empty when the forwarder is the author) — the flag
+     * rides here, not in the file's own info text, for the reason
+     * the class comment gives. Null when the send carries no id —
+     * the host's relays always re-announce the original id, so
+     * relayed files keep theirs (and their forward flag with it).
      */
-    private fun messageIdText(wireId: String?): String? =
-        wireId?.takeIf { it.isNotEmpty() }?.let { MEDIA_ID_PREFIX + it }
+    private fun messageIdText(
+        wireId: String?,
+        forwarded: Boolean = false,
+        forwardedFrom: String? = null
+    ): String? =
+        wireId?.takeIf { it.isNotEmpty() }?.let { id ->
+            val base = MEDIA_ID_PREFIX + id
+            if (!forwarded) {
+                base
+            } else {
+                base + FORWARD_PREFIX +
+                    wireQuoteField(
+                        forwardedFrom ?: "", MAX_SENDER_NAME_LENGTH
+                    )
+            }
+        }
 
     /**
      * Sends one info text and then one file to all [targets]. Used for
@@ -1496,7 +1630,7 @@ class ChatManager(
         filePayloadEndpoints.clear()
         pendingFiles.clear()
         pendingQuotes.clear()
-        pendingWireIds.clear()
+        pendingMediaInfos.clear()
         // Transfers that never finished will never report now; their
         // messages simply keep the single "sent" tick.
         outgoingPayloads.clear()
@@ -1784,7 +1918,7 @@ class ChatManager(
             // that file, and any half-arrived file of it are stale now.
             pendingFiles.remove(endpointId)
             pendingQuotes.remove(endpointId)
-            pendingWireIds.remove(endpointId)
+            pendingMediaInfos.remove(endpointId)
             // The same for a walkie-talkie talk with this phone: its
             // outgoing talk pipe closes, a talk it was sending us is
             // cut short (its pump ends the announced talk as it
@@ -1851,12 +1985,14 @@ class ChatManager(
                     if (raw.startsWith(MEDIA_ID_PREFIX)) {
                         // The id of the voice, photo, video or file
                         // this phone is about to send, so reactions can
-                        // refer to that message later. It is held until
-                        // the file's transfer finishes, like the quote.
+                        // refer to that message later — and, when the
+                        // message is a forward, that it is one and whose
+                        // message it forwards. It is held until the
+                        // file's transfer finishes, like the quote.
                         // A malformed one is simply dropped — it is a
                         // control text, not a chat message.
                         parseMessageIdInfo(raw)?.let {
-                            pendingWireIds[endpointId] = it
+                            pendingMediaInfos[endpointId] = it
                         }
                         return
                     }
@@ -1939,10 +2075,19 @@ class ChatManager(
                     // like everything else, so the group stays in step.
                     // A reaction ("#REACT#" control text) is handled the
                     // same way: reported to the listener, never shown.
+                    // A forward ("#FWD#" prefix, see parseForwardText)
+                    // wraps the real content instead: what follows the
+                    // prefix is the message — a text, or a "#LOC#" text
+                    // when a position was forwarded — and the name in
+                    // the prefix says who wrote the original.
                     val location = parseLocationText(message.text)
                     val reaction = parseReactionText(message.text)
                     val edit = parseEditText(message.text)
                     val deletion = parseDeleteText(message.text)
+                    val forward = parseForwardText(message.text)
+                    val forwardLocation = forward?.let {
+                        parseLocationText(it.second)
+                    }
                     when {
                         // Walkie-talkie control texts ("#TALK#START"
                         // / "#TALK#END"), handled exactly like the
@@ -1972,11 +2117,34 @@ class ChatManager(
                             location.first, location.second, message.senderName,
                             message.id
                         )
+                        // A forwarded position: the "#FWD#" prefix is
+                        // stripped and the "#LOC#" text inside it is
+                        // what counts; the message is reported as a
+                        // location, flagged as a forward. A forwarded
+                        // text is reported the same way — its real
+                        // text, no quote (a forward never carries
+                        // one), flagged, with the original author's
+                        // name from the prefix.
+                        forwardLocation != null -> listener
+                            .onLocationMessageReceived(
+                                forwardLocation.first,
+                                forwardLocation.second,
+                                message.senderName, message.id,
+                                forwarded = true,
+                                forwardedFrom = forward?.first
+                            )
+                        forward != null -> listener.onMessageReceived(
+                            forward.second, message.senderName,
+                            null, null, message.id,
+                            forwarded = true,
+                            forwardedFrom = forward.first
+                        )
                         message.text.startsWith(LOCATION_PREFIX) -> Unit
                         message.text.startsWith(REACT_PREFIX) -> Unit
                         message.text.startsWith(EDIT_PREFIX) -> Unit
                         message.text.startsWith(DELETE_PREFIX) -> Unit
                         message.text.startsWith(TALK_PREFIX) -> Unit
+                        message.text.startsWith(FORWARD_PREFIX) -> Unit
                         else -> listener.onMessageReceived(
                             message.text, message.senderName,
                             message.quotedSender, message.quotedText,
@@ -2021,7 +2189,7 @@ class ChatManager(
                     // quote or message id waiting for it — are stale too.
                     pendingFiles.remove(endpointId)
                     pendingQuotes.remove(endpointId)
-                    pendingWireIds.remove(endpointId)
+                    pendingMediaInfos.remove(endpointId)
                 }
                 if (!wasTyping) {
                     listener.onError("A message could not be transferred.")
@@ -2044,12 +2212,16 @@ class ChatManager(
                     // The info message said what kind of file this is. No
                     // info (or a lost one) keeps the old behavior: voice.
                     // A quote that was sent just before the file belongs
-                    // to this message and is used up now; so is the id
-                    // that was announced for it, which the message takes
-                    // as its own (and the relay below re-announces).
+                    // to this message and is used up now; so is what was
+                    // announced for it in the "#MID#" text — the id the
+                    // message takes as its own (and the relay below
+                    // re-announces) and whether it is a forward.
                     val info = pendingFiles.remove(endpointId)
                     val quote = pendingQuotes.remove(endpointId)
-                    val wireId = pendingWireIds.remove(endpointId)
+                    val mediaInfo = pendingMediaInfos.remove(endpointId)
+                    val wireId = mediaInfo?.wireId
+                    val forwarded = mediaInfo?.forwarded ?: false
+                    val forwardedFrom = mediaInfo?.forwardedFrom
                     when (info?.kind ?: IncomingFileKind.VOICE) {
                         IncomingFileKind.VOICE -> {
                             val dest = saveReceivedVoiceFile(filePayload) ?: return
@@ -2057,12 +2229,13 @@ class ChatManager(
                                 ?: fileDurationSeconds(dest)
                             listener.onVoiceMessageReceived(
                                 dest.absolutePath, duration, info?.senderName,
-                                quote?.sender, quote?.text, wireId
+                                quote?.sender, quote?.text, wireId,
+                                forwarded, forwardedFrom
                             )
                             if (role == Role.HUB) {
                                 relayVoiceFile(
                                     dest, duration, info?.senderName, endpointId,
-                                    quote, wireId
+                                    quote, wireId, forwarded, forwardedFrom
                                 )
                             }
                         }
@@ -2070,11 +2243,13 @@ class ChatManager(
                             val dest = saveReceivedPhotoFile(filePayload) ?: return
                             listener.onPhotoMessageReceived(
                                 dest.absolutePath, info?.senderName,
-                                quote?.sender, quote?.text, wireId
+                                quote?.sender, quote?.text, wireId,
+                                forwarded, forwardedFrom
                             )
                             if (role == Role.HUB) {
                                 relayPhotoFile(
-                                    dest, info?.senderName, endpointId, quote, wireId
+                                    dest, info?.senderName, endpointId, quote,
+                                    wireId, forwarded, forwardedFrom
                                 )
                             }
                         }
@@ -2082,10 +2257,14 @@ class ChatManager(
                             val dest = saveReceivedFile(filePayload, info?.fileName) ?: return
                             listener.onFileMessageReceived(
                                 dest.absolutePath, dest.name, dest.length(),
-                                info?.senderName, quote?.sender, quote?.text, wireId
+                                info?.senderName, quote?.sender, quote?.text,
+                                wireId, forwarded, forwardedFrom
                             )
                             if (role == Role.HUB) {
-                                relayFile(dest, info?.senderName, endpointId, quote, wireId)
+                                relayFile(
+                                    dest, info?.senderName, endpointId, quote,
+                                    wireId, forwarded, forwardedFrom
+                                )
                             }
                         }
                         IncomingFileKind.VIDEO -> {
@@ -2095,11 +2274,13 @@ class ChatManager(
                             val duration = fileDurationSeconds(dest)
                             listener.onVideoMessageReceived(
                                 dest.absolutePath, duration, info?.senderName,
-                                quote?.sender, quote?.text, wireId
+                                quote?.sender, quote?.text, wireId,
+                                forwarded, forwardedFrom
                             )
                             if (role == Role.HUB) {
                                 relayVideoFile(
-                                    dest, info?.senderName, endpointId, quote, wireId
+                                    dest, info?.senderName, endpointId, quote,
+                                    wireId, forwarded, forwardedFrom
                                 )
                             }
                         }
@@ -2120,7 +2301,9 @@ class ChatManager(
         senderName: String?,
         exceptEndpointId: String,
         quote: PendingQuote? = null,
-        wireId: String? = null
+        wireId: String? = null,
+        forwarded: Boolean = false,
+        forwardedFrom: String? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -2132,7 +2315,7 @@ class ChatManager(
         sendInfoAndFile(
             targets, info, file, null, 0,
             replyInfo(quote?.sender, quote?.text),
-            messageIdText(wireId)
+            messageIdText(wireId, forwarded, forwardedFrom)
         )
     }
 
@@ -2141,7 +2324,9 @@ class ChatManager(
         senderName: String?,
         exceptEndpointId: String,
         quote: PendingQuote? = null,
-        wireId: String? = null
+        wireId: String? = null,
+        forwarded: Boolean = false,
+        forwardedFrom: String? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -2153,7 +2338,7 @@ class ChatManager(
         sendInfoAndFile(
             targets, info, file, null, 0,
             replyInfo(quote?.sender, quote?.text),
-            messageIdText(wireId)
+            messageIdText(wireId, forwarded, forwardedFrom)
         )
     }
 
@@ -2162,7 +2347,9 @@ class ChatManager(
         senderName: String?,
         exceptEndpointId: String,
         quote: PendingQuote? = null,
-        wireId: String? = null
+        wireId: String? = null,
+        forwarded: Boolean = false,
+        forwardedFrom: String? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -2174,7 +2361,7 @@ class ChatManager(
         sendInfoAndFile(
             targets, info, file, null, 0,
             replyInfo(quote?.sender, quote?.text),
-            messageIdText(wireId)
+            messageIdText(wireId, forwarded, forwardedFrom)
         )
     }
 
@@ -2183,7 +2370,9 @@ class ChatManager(
         senderName: String?,
         exceptEndpointId: String,
         quote: PendingQuote? = null,
-        wireId: String? = null
+        wireId: String? = null,
+        forwarded: Boolean = false,
+        forwardedFrom: String? = null
     ) {
         val targets = sendTargets(exclude = exceptEndpointId)
         if (targets.isEmpty()) return
@@ -2195,27 +2384,62 @@ class ChatManager(
         sendInfoAndFile(
             targets, info, file, null, 0,
             replyInfo(quote?.sender, quote?.text),
-            messageIdText(wireId)
+            messageIdText(wireId, forwarded, forwardedFrom)
         )
     }
 
     /**
-     * Reads a message-id info text: "#MID#" + a UUID. Only the exact
-     * UUID shape is accepted (36 characters, dashes where a UUID has
-     * them — the same check [unpackMessage] makes), so a typed chat
-     * text that happens to start with the prefix can never be taken
-     * for one; null then, and the text is dropped as a control text
-     * gone wrong, never shown as a chat message.
+     * Reads a message-id info text: "#MID#" + a UUID, plus — when the
+     * media message is a forward — "#FWD#" and the original author's
+     * name (which may be empty: the forwarder is the author). Only
+     * the exact UUID shape is accepted for the id (36 characters,
+     * dashes where a UUID has them — the same check [unpackMessage]
+     * makes), so a typed chat text that happens to start with the
+     * prefix can never be taken for one; and a tail that is not a
+     * forward segment makes the whole text unreadable, never
+     * half-read. Null then, and the text is dropped as a control
+     * text gone wrong, never shown as a chat message. (An older app
+     * version reading a forwarded "#MID#" text drops it the same way
+     * — it insists on exactly the id — so the file still arrives
+     * there, just without an id; see the class comment.)
      */
-    private fun parseMessageIdInfo(raw: String): String? {
+    private fun parseMessageIdInfo(raw: String): PendingMediaInfo? {
         val rest = raw.substring(MEDIA_ID_PREFIX.length)
-        if (rest.length != MESSAGE_ID_LENGTH) return null
-        if (rest[8] != '-' || rest[13] != '-' || rest[18] != '-' ||
-            rest[23] != '-'
-        ) {
-            return null
-        }
-        return rest
+        if (rest.length < MESSAGE_ID_LENGTH) return null
+        val id = rest.substring(0, MESSAGE_ID_LENGTH)
+        if (!isMessageIdShape(id)) return null
+        val tail = rest.substring(MESSAGE_ID_LENGTH)
+        if (tail.isEmpty()) return PendingMediaInfo(id, false, null)
+        if (!tail.startsWith(FORWARD_PREFIX)) return null
+        val author = tail.substring(FORWARD_PREFIX.length)
+        // A name never contains '#': [wireQuoteField] removed it on
+        // the sending side. One that does is not a name at all.
+        if (author.contains('#')) return null
+        return PendingMediaInfo(id, true, author.takeIf { it.isNotEmpty() })
+    }
+
+    /**
+     * Reads a forward prefix in a received text: "#FWD#" + the
+     * original author's name + "#" + the real content (a text, or a
+     * "#LOC#" control text when a position was forwarded). Returns
+     * the author (null when the name is empty — the forwarder is the
+     * author, or the author is unknown) and the content. The name
+     * ends at the FIRST '#': it never contains one, because
+     * [wireQuoteField] removed it on the sending side — the content
+     * after the separator may contain as many as it likes. Null
+     * when there is no second '#' or the content is empty: a
+     * control text gone wrong, dropped silently (but still relayed
+     * by the hub, like every control text).
+     */
+    private fun parseForwardText(text: String): Pair<String?, String>? {
+        if (!text.startsWith(FORWARD_PREFIX)) return null
+        val rest = text.substring(FORWARD_PREFIX.length)
+        val separator = rest.indexOf('#')
+        if (separator < 0) return null
+        val author = rest.substring(0, separator).takeIf { it.isNotEmpty() }
+        val body = rest.substring(separator + 1)
+        if (body.isEmpty()) return null
+        return author to body
     }
 
     /**
@@ -2712,6 +2936,14 @@ class ChatManager(
         // "#DEL#" + target message id (see sendDeleteMessage /
         // parseDeleteText).
         private const val DELETE_PREFIX = "#DEL#"
+        // A forward of an earlier message. In a text payload:
+        // "#FWD#" + the original author's name + "#" + the real
+        // content (a text, or a "#LOC#" text for a forwarded
+        // position) — see sendForwardedText / parseForwardText.
+        // Appended to a media message's "#MID#" text instead:
+        // "#MID#" + id + "#FWD#" + the author's name — see
+        // messageIdText / parseMessageIdInfo.
+        private const val FORWARD_PREFIX = "#FWD#"
         // Walkie-talkie control texts, packed inside ordinary text
         // payloads like "#LOC#" and "#REACT#" are: "#TALK#START"
         // just before the audio stream opens, "#TALK#END" just

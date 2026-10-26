@@ -27,6 +27,19 @@
             android:textStyle="bold"
             android:visibility="gone" />
 
+        <TextView
+            android:id="@+id/forwardedText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="2dp"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:maxWidth="260dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp"
+            android:textStyle="italic"
+            android:visibility="gone" />
+
         <LinearLayout
             android:id="@+id/quoteBlock"
             android:layout_width="wrap_content"
