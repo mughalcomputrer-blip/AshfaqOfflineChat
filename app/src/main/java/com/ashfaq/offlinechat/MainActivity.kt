@@ -42,6 +42,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
@@ -126,6 +127,17 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private var mediaQueueInFlightLocalId = 0L
     private var mediaQueueSent = 0
     private var mediaQueueFailed = 0
+
+    // The in-app camera (Update #20): the capture file waiting for
+    // the camera app to come back (null while no shot is out), and
+    // the captures already handed to the send pipeline, by the Uri
+    // they travel under. The pipeline prepares its own copy of a
+    // photo, so a capture original is deleted as soon as the send
+    // flow has read it — right after a direct send, in the queue
+    // pump when a queued shot's turn came, or in endMediaBatch for
+    // one whose turn never came.
+    private var pendingCameraFile: File? = null
+    private val cameraTempFiles = mutableMapOf<Uri, File>()
 
     // Voice recording state.
     private var recorder: MediaRecorder? = null
@@ -257,6 +269,38 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         ActivityResultContracts.PickMultipleVisualMedia(MAX_PICK_ITEMS)
     ) { uris ->
         onMediaPicked(uris)
+    }
+
+    // The in-app camera (Update #20): the system camera app writes
+    // the shot into a cache file we prepared for it (handed over
+    // through FileProvider), so this app needs no camera permission
+    // of its own. A cancelled shot comes back false and stays
+    // silent; a finished one is sent like a picked photo (see
+    // onCameraPhotoTaken).
+    private val cameraLauncher = registerForActivityResult(
+        ActivityResultContracts.TakePicture()
+    ) { success ->
+        val file = pendingCameraFile
+        pendingCameraFile = null
+        if (file != null) {
+            when {
+                closing -> file.delete()
+                // Cancelled — the contract folds a failed capture
+                // into the same false, so it stays silent too:
+                // no bubble, no toast.
+                !success -> file.delete()
+                !file.exists() || file.length() == 0L -> {
+                    // The camera said yes but left nothing usable
+                    // behind — a real failure, so it is reported
+                    // like any other photo that could not be sent.
+                    file.delete()
+                    Toast.makeText(
+                        this, R.string.photo_failed, Toast.LENGTH_SHORT
+                    ).show()
+                }
+                else -> onCameraPhotoTaken(file)
+            }
+        }
     }
 
     // The system document picker, for files of any kind: again no storage
@@ -458,21 +502,25 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
     /**
      * The ➕ attach button in the input row: a WhatsApp-style menu of
-     * the three things that can be attached — a photo or video, a
-     * file, or the current location — each calling the same flow its
-     * own button used to call before the row was decluttered.
+     * the four things that can be attached — a photo or video from
+     * the gallery, a fresh photo from the camera, a file, or the
+     * current location — each calling the same flow its own button
+     * used to call before the row was decluttered.
      */
     private fun showAttachMenu(anchor: View) {
         val itemMedia = 1
         val itemFile = 2
         val itemLocation = 3
+        val itemCamera = 4
         val popup = PopupMenu(this, anchor)
         popup.menu.add(0, itemMedia, 0, R.string.pick_media)
-        popup.menu.add(0, itemFile, 1, R.string.send_file)
-        popup.menu.add(0, itemLocation, 2, R.string.share_location)
+        popup.menu.add(0, itemCamera, 1, R.string.take_photo)
+        popup.menu.add(0, itemFile, 2, R.string.send_file)
+        popup.menu.add(0, itemLocation, 3, R.string.share_location)
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 itemMedia -> onPhotoClicked()
+                itemCamera -> onCameraClicked()
                 itemFile -> onFileClicked()
                 itemLocation -> onLocationClicked()
             }
@@ -1611,6 +1659,59 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
     // ---------- Photo and video messages ----------
 
+    /**
+     * The ➕ menu's Camera item (Update #20): open the system
+     * camera app so a photo can be taken and sent without a trip
+     * to the gallery. The shot is written straight into a cache
+     * file of ours (handed to the camera through FileProvider —
+     * the cache folder is already shared that way), which is why
+     * no camera permission is needed. Like the gallery pick, the
+     * connection is checked first, with the same toast; if the
+     * connection drops while the camera is open, the finished shot
+     * still lands in the send flow, which reports that the same
+     * way it does for a picked photo.
+     */
+    private fun onCameraClicked() {
+        if (!chatManager.isConnected()) {
+            Toast.makeText(this, R.string.not_connected_media, Toast.LENGTH_SHORT).show()
+            return
+        }
+        // Its own "camera_" prefix, so a prepared photo written in
+        // the same millisecond can never collide with it.
+        val file = File(cacheDir, "camera_${System.currentTimeMillis()}.jpg")
+        pendingCameraFile = file
+        try {
+            cameraLauncher.launch(
+                FileProvider.getUriForFile(this, packageName + ".fileprovider", file)
+            )
+        } catch (e: Exception) {
+            // No camera app answered: nothing was taken.
+            pendingCameraFile = null
+            file.delete()
+            Toast.makeText(this, R.string.photo_failed, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * A finished camera shot joins the very path a picked photo
+     * takes: [onMediaPicked] sends it at once when the send queue
+     * is idle (pending reply and all) or lines it up behind a
+     * running batch, where the pump sends it in its turn. The
+     * capture original is only the pipeline's raw material — the
+     * send flow prepares its own copy — so once the flow has read
+     * it the original is deleted: right here when the shot went
+     * straight out, in the pump when a queued shot's turn came,
+     * or in [endMediaBatch] for one whose turn never came.
+     */
+    private fun onCameraPhotoTaken(file: File) {
+        val uri = FileProvider.getUriForFile(this, packageName + ".fileprovider", file)
+        cameraTempFiles[uri] = file
+        onMediaPicked(listOf(uri))
+        if (!mediaQueueItems.contains(uri)) {
+            cameraTempFiles.remove(uri)?.delete()
+        }
+    }
+
     private fun onPhotoClicked() {
         if (!chatManager.isConnected()) {
             Toast.makeText(this, R.string.not_connected_media, Toast.LENGTH_SHORT).show()
@@ -1688,6 +1789,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             val uri = mediaQueueItems[mediaQueueIndex]
             mediaQueueIndex++
             val localId = sendPickedMedia(uri, usePendingQuote = false)
+            // A camera capture travelling in the queue has been
+            // read by the send flow now (it prepares its own copy
+            // synchronously), so its original can go, sent or not.
+            cameraTempFiles.remove(uri)?.delete()
             if (localId != null) {
                 mediaQueueInFlightLocalId = localId
                 return
@@ -1717,6 +1822,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         mediaQueueInFlightLocalId = 0L
         mediaQueueSent = 0
         mediaQueueFailed = 0
+        // Camera captures whose turn never came (a batch stopped
+        // early) are no longer needed either.
+        for (capture in cameraTempFiles.values) capture.delete()
+        cameraTempFiles.clear()
         if (total <= 1) return
         if (stoppedEarly) {
             Toast.makeText(
