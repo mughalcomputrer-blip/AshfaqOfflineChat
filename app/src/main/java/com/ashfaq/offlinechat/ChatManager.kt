@@ -955,7 +955,7 @@ class ChatManager(
             openTalkRelays(endpointId)
         }
         Thread { runTalkPump(session) }.apply {
-            name = "walkie-talk-pump"
+            this.name = "walkie-talk-pump"
             isDaemon = true
             start()
         }
