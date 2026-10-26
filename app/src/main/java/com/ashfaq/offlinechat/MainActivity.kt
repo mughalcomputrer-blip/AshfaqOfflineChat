@@ -111,6 +111,22 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     // is, when its transfer completes.
     private val receivingPlaceholders = mutableMapOf<Long, Long>()
 
+    // The multi-pick send queue (Update #19): the picks of one
+    // multi-select (or picks added while one is running), in the
+    // order the user chose them; mediaQueueIndex is the next one to
+    // start. Only one batch item is ever being sent at a time —
+    // mediaQueueInFlightLocalId is its local id (0 while idle) —
+    // because the receiving side holds just one file's info per
+    // phone at a time, so two of our files in flight together could
+    // be paired with each other's info over there. The counters
+    // feed the one summary toast a batch ends with when some items
+    // could not be sent (or the connection dropped half-way).
+    private val mediaQueueItems = mutableListOf<Uri>()
+    private var mediaQueueIndex = 0
+    private var mediaQueueInFlightLocalId = 0L
+    private var mediaQueueSent = 0
+    private var mediaQueueFailed = 0
+
     // Voice recording state.
     private var recorder: MediaRecorder? = null
     private var recordingFile: File? = null
@@ -218,22 +234,29 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     // The system media picker (photos and videos): no storage
     // permission is needed, and a cancelled pick simply gives us
     // nothing (not an error). The picked item's type decides which
-    // send flow it takes.
+    // send flow it takes. This is the single-item picker; it is kept
+    // as the fallback for a phone whose system picker cannot do a
+    // multi-select (see onPhotoClicked).
     private val photoPickerLauncher = registerForActivityResult(
         ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) {
-            val mimeType = try {
-                contentResolver.getType(uri)
-            } catch (e: Exception) {
-                null
-            }
-            if (mimeType != null && mimeType.startsWith("video/")) {
-                prepareAndSendVideo(uri)
-            } else {
-                prepareAndSendPhoto(uri)
-            }
+            sendPickedMedia(uri, usePendingQuote = true)
         }
+    }
+
+    // The multi-select media picker (Update #19): up to
+    // MAX_PICK_ITEMS photos and videos in one go. The picks are NOT
+    // blasted out together — the receiving side keeps only one
+    // file's info waiting per phone (ChatManager's pendingFiles), so
+    // a burst could pair a file with the next item's info. Instead
+    // the picks join the small send queue below and go out one at a
+    // time, each starting only when the previous file's transfer has
+    // reported success or failure.
+    private val mediaPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(MAX_PICK_ITEMS)
+    ) { uris ->
+        onMediaPicked(uris)
     }
 
     // The system document picker, for files of any kind: again no storage
@@ -1593,19 +1616,132 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             Toast.makeText(this, R.string.not_connected_media, Toast.LENGTH_SHORT).show()
             return
         }
-        photoPickerLauncher.launch(
-            PickVisualMediaRequest.Builder()
-                .setMediaType(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
-                .build()
-        )
+        val request = PickVisualMediaRequest.Builder()
+            .setMediaType(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+            .build()
+        try {
+            mediaPickerLauncher.launch(request)
+        } catch (e: Exception) {
+            // A phone whose picker cannot open as a multi-select
+            // keeps the single pick this button always had.
+            photoPickerLauncher.launch(request)
+        }
+    }
+
+    /**
+     * One picked photo or video, routed by its type to the matching
+     * send flow. Returns the sent message's local id, or null when
+     * nothing was sent (the flow itself already gave the feedback:
+     * a toast, or the too-large error). [usePendingQuote] is today's
+     * behaviour for a lone pick; a batch item passes false so one
+     * pending reply is never stamped onto every item of a batch
+     * (and the pending reply is left untouched for later).
+     */
+    private fun sendPickedMedia(uri: Uri, usePendingQuote: Boolean): Long? {
+        val mimeType = try {
+            contentResolver.getType(uri)
+        } catch (e: Exception) {
+            null
+        }
+        return if (mimeType != null && mimeType.startsWith("video/")) {
+            prepareAndSendVideo(uri, usePendingQuote)
+        } else {
+            prepareAndSendPhoto(uri, usePendingQuote)
+        }
+    }
+
+    /**
+     * What the multi-select picker handed back. Nothing picked
+     * (cancelled) stays silent, exactly like the single pick always
+     * did. One item takes the ordinary single-send flow, pending
+     * reply and all. Two or more start the send queue (or join the
+     * one already running), where they go out one at a time with no
+     * reply attached.
+     */
+    private fun onMediaPicked(uris: List<Uri>) {
+        val picked = uris.take(MAX_PICK_ITEMS)
+        if (picked.isEmpty()) return
+        if (mediaQueueItems.isEmpty() && picked.size == 1) {
+            sendPickedMedia(picked[0], usePendingQuote = true)
+            return
+        }
+        mediaQueueItems.addAll(picked)
+        pumpMediaQueue()
+    }
+
+    /**
+     * Starts the next queued pick, if none is in flight. An item
+     * that cannot even start (an unreadable photo, an over-cap
+     * video — the flow already said so) is counted and skipped, not
+     * fatal; the batch only stops early when the connection is
+     * gone. The item that does start finishes through
+     * onMessageDelivered / onSendProgressEnded, which call back
+     * here for the next one.
+     */
+    private fun pumpMediaQueue() {
+        if (mediaQueueInFlightLocalId != 0L) return
+        while (mediaQueueIndex < mediaQueueItems.size) {
+            if (!chatManager.isConnected()) {
+                endMediaBatch(stoppedEarly = true)
+                return
+            }
+            val uri = mediaQueueItems[mediaQueueIndex]
+            mediaQueueIndex++
+            val localId = sendPickedMedia(uri, usePendingQuote = false)
+            if (localId != null) {
+                mediaQueueInFlightLocalId = localId
+                return
+            }
+            mediaQueueFailed++
+        }
+        endMediaBatch(stoppedEarly = false)
+    }
+
+    /**
+     * Closes the current batch (queue empty, or stopped early by a
+     * lost connection / disconnect) and resets its state. At most
+     * one summary toast: how many items were sent when it stopped
+     * early, or how many of them could not be sent when it ran its
+     * course — a batch that fully sent stays silent, like a single
+     * photo always did. Does nothing when no batch is active, so
+     * the several paths that can end one (last delivery, a failed
+     * transfer, onDisconnected) never toast twice.
+     */
+    private fun endMediaBatch(stoppedEarly: Boolean) {
+        if (mediaQueueItems.isEmpty()) return
+        val total = mediaQueueItems.size
+        val sent = mediaQueueSent
+        val failed = mediaQueueFailed
+        mediaQueueItems.clear()
+        mediaQueueIndex = 0
+        mediaQueueInFlightLocalId = 0L
+        mediaQueueSent = 0
+        mediaQueueFailed = 0
+        if (total <= 1) return
+        if (stoppedEarly) {
+            Toast.makeText(
+                this,
+                getString(R.string.media_batch_stopped, sent, total),
+                Toast.LENGTH_LONG
+            ).show()
+        } else if (failed > 0) {
+            Toast.makeText(
+                this,
+                getString(R.string.media_batch_some_failed, failed, total),
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     /**
      * Shrinks the picked photo (longest side at most [MAX_PHOTO_DIMENSION]
      * pixels), saves it as a JPEG in the cache folder and sends it. Working
-     * on a small copy keeps the offline transfer fast.
+     * on a small copy keeps the offline transfer fast. Returns the sent
+     * message's local id, or null when nothing was sent. A batch item
+     * passes [usePendingQuote] = false so the pending reply is neither
+     * attached to it nor cleared by it.
      */
-    private fun prepareAndSendPhoto(uri: Uri) {
+    private fun prepareAndSendPhoto(uri: Uri, usePendingQuote: Boolean = true): Long? {
         val file = try {
             createPreparedPhotoFile(uri)
         } catch (e: Exception) {
@@ -1613,17 +1749,19 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
         if (file == null) {
             Toast.makeText(this, R.string.photo_failed, Toast.LENGTH_SHORT).show()
-            return
+            return null
         }
+        val quotedSender = if (usePendingQuote) pendingQuotedSender else null
+        val quotedText = if (usePendingQuote) pendingQuotedText else null
         val localId = nextLocalId++
         val wireId = UUID.randomUUID().toString()
         if (!chatManager.sendPhotoMessage(
-                file, localId, pendingQuotedSender, pendingQuotedText,
+                file, localId, quotedSender, quotedText,
                 wireId = wireId
             )
         ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
-            return
+            return null
         }
         addMessage(
             ChatMessage(
@@ -1632,12 +1770,13 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 type = ChatMessage.Type.PHOTO,
                 imagePath = file.absolutePath,
                 localId = localId,
-                quotedSender = pendingQuotedSender,
-                quotedText = pendingQuotedText,
+                quotedSender = quotedSender,
+                quotedText = quotedText,
                 wireId = wireId
             )
         )
-        clearPendingQuote()
+        if (usePendingQuote) clearPendingQuote()
+        return localId
     }
 
     private fun createPreparedPhotoFile(uri: Uri): File? {
@@ -1751,9 +1890,12 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
      * and sends it as it is — videos are not shrunk or re-encoded
      * (that would need extra libraries). The same 100 MB cap as for
      * files applies, checked up front when the picker reports a size
-     * and again during the copy.
+     * and again during the copy. Returns the sent message's local id,
+     * or null when nothing was sent. A batch item passes
+     * [usePendingQuote] = false so the pending reply is neither
+     * attached to it nor cleared by it.
      */
-    private fun prepareAndSendVideo(uri: Uri) {
+    private fun prepareAndSendVideo(uri: Uri, usePendingQuote: Boolean = true): Long? {
         val originalName = queryDisplayName(uri)
             ?: "video_${System.currentTimeMillis()}"
         var cleanName = ChatManager.sanitizeFileName(originalName)
@@ -1779,30 +1921,32 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         val knownSize = queryFileSize(uri)
         if (knownSize != null && knownSize > MAX_FILE_SIZE_BYTES) {
             onError(getString(R.string.file_too_large))
-            return
+            return null
         }
 
         val file = when (val result = copyPickedFile(uri, cleanName)) {
             is CopyResult.Done -> result.file
             CopyResult.TooLarge -> {
                 onError(getString(R.string.file_too_large))
-                return
+                return null
             }
             CopyResult.Failed -> {
                 Toast.makeText(this, R.string.video_failed, Toast.LENGTH_SHORT).show()
-                return
+                return null
             }
         }
         val durationSeconds = pickedVideoDurationSeconds(file)
+        val quotedSender = if (usePendingQuote) pendingQuotedSender else null
+        val quotedText = if (usePendingQuote) pendingQuotedText else null
         val localId = nextLocalId++
         val wireId = UUID.randomUUID().toString()
         if (!chatManager.sendVideoMessage(
-                file, localId, pendingQuotedSender, pendingQuotedText,
+                file, localId, quotedSender, quotedText,
                 wireId = wireId
             )
         ) {
             Toast.makeText(this, R.string.not_connected_cannot_send, Toast.LENGTH_SHORT).show()
-            return
+            return null
         }
         addMessage(
             ChatMessage(
@@ -1812,12 +1956,13 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 videoPath = file.absolutePath,
                 durationSeconds = durationSeconds,
                 localId = localId,
-                quotedSender = pendingQuotedSender,
-                quotedText = pendingQuotedText,
+                quotedSender = quotedSender,
+                quotedText = quotedText,
                 wireId = wireId
             )
         )
-        clearPendingQuote()
+        if (usePendingQuote) clearPendingQuote()
+        return localId
     }
 
     /** Reads the length of a video file, in seconds. 0 when unknown. */
@@ -2444,6 +2589,11 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
         receivingPlaceholders.clear()
         adapter.clearTransferProgress()
+        // A multi-pick batch dies with the connection too: whatever
+        // was still queued will not be sent. (The in-flight item's
+        // own failure may end the batch first — endMediaBatch runs
+        // at most once, so the summary toast never doubles.)
+        endMediaBatch(stoppedEarly = true)
         // Any walkie-talkie talk died with the connection; an open
         // dialog just loses its button (refreshWalkieDialog shows
         // the not-connected line), it is not closed from under the
@@ -2547,6 +2697,12 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         if (adapter.markDelivered(localId)) {
             ChatHistoryStore.save(this, adapter.snapshot())
         }
+        // A finished batch item lets the next queued pick go out.
+        if (localId == mediaQueueInFlightLocalId && mediaQueueInFlightLocalId != 0L) {
+            mediaQueueInFlightLocalId = 0L
+            mediaQueueSent++
+            pumpMediaQueue()
+        }
     }
 
     override fun onSendProgress(localId: Long, percent: Int) {
@@ -2559,6 +2715,14 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         // The send failed or was cancelled (the error itself comes
         // through onError, as before): its bar simply goes away.
         adapter.clearProgress(localId)
+        // A batch item whose transfer died still frees the queue:
+        // it is counted as failed and the next pick goes out (or
+        // the batch ends there, if the connection went with it).
+        if (localId == mediaQueueInFlightLocalId && mediaQueueInFlightLocalId != 0L) {
+            mediaQueueInFlightLocalId = 0L
+            mediaQueueFailed++
+            pumpMediaQueue()
+        }
     }
 
     override fun onReceiveStarted(
@@ -2905,6 +3069,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         private const val MAX_RECORDING_SECONDS = 120
         private const val MAX_PHOTO_DIMENSION = 1600 // pixels, longest side
         private const val PHOTO_JPEG_QUALITY = 80
+        // How many photos/videos one multi-select pick may hold
+        // (Update #19); the picker itself enforces the same cap.
+        private const val MAX_PICK_ITEMS = 10
         private const val MAX_FILE_SIZE_BYTES = 100L * 1024 * 1024 // 100 MB
         private const val QUOTE_PREVIEW_MAX_CHARS = 60
         // A last-known position older than this is not shared; a fresh

@@ -35,6 +35,8 @@
 <string name="video_message">Video message</string>
 <string name="play_video">Play video</string>
 <string name="video_failed">The video could not be sent.</string>
+<string name="media_batch_some_failed">%1$d of %2$d items could not be sent.</string>
+<string name="media_batch_stopped">Connection lost. %1$d of %2$d items were sent.</string>
 <string name="send_file">Send a file</string>
 <string name="file_message">File message</string>
 <string name="not_connected_file">Not connected. File not sent.</string>
