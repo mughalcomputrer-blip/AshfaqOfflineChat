@@ -26,19 +26,48 @@ object ChatHistoryStore {
     // asked for and never block the screen.
     private val writer = Executors.newSingleThreadExecutor()
 
+    /** The file the saved history lives in (read directly by the backup). */
+    fun historyFile(context: Context): File =
+        File(context.applicationContext.filesDir, HISTORY_FILE_NAME)
+
     /** Loads the saved chat, oldest first. Empty when nothing is saved. */
     fun load(context: Context): List<ChatMessage> {
-        val file = File(context.applicationContext.filesDir, HISTORY_FILE_NAME)
+        val file = historyFile(context)
         if (!file.exists()) return emptyList()
+        val text = try {
+            file.readText(Charsets.UTF_8)
+        } catch (e: Exception) {
+            // A damaged history file must never stop the app from opening.
+            return emptyList()
+        }
+        return parseMessages(text)
+    }
+
+    /**
+     * Takes over a history in this store's own JSON form — a backup
+     * being restored (see ChatBackup) — parses it exactly like [load]
+     * does and saves the result, replacing the history saved before.
+     * Media files must already be in place: an entry whose file is
+     * missing is skipped by the parse, exactly as in [load]. Returns
+     * the messages the chat should show now.
+     */
+    fun importJson(context: Context, jsonText: String): List<ChatMessage> {
+        val messages = parseMessages(jsonText)
+        save(context, messages)
+        return messages
+    }
+
+    /** Parses history JSON the way [load] does. Empty on any damage. */
+    private fun parseMessages(text: String): List<ChatMessage> {
         val messages = mutableListOf<ChatMessage>()
         try {
-            val array = JSONArray(file.readText(Charsets.UTF_8))
+            val array = JSONArray(text)
             for (i in 0 until array.length()) {
                 val item = array.optJSONObject(i) ?: continue
                 toMessage(item)?.let { messages.add(it) }
             }
         } catch (e: Exception) {
-            // A damaged history file must never stop the app from opening.
+            // A damaged history must never stop the app from opening.
             return emptyList()
         }
         return messages.takeLast(MAX_HISTORY)
@@ -51,10 +80,10 @@ object ChatHistoryStore {
         } catch (e: Exception) {
             return
         }
-        val filesDir = context.applicationContext.filesDir
+        val file = historyFile(context)
         writer.execute {
             try {
-                File(filesDir, HISTORY_FILE_NAME).writeText(text, Charsets.UTF_8)
+                file.writeText(text, Charsets.UTF_8)
             } catch (ignored: Exception) {
                 // If one save fails, the chat on screen is unaffected;
                 // the next message saves everything again anyway.
@@ -64,10 +93,10 @@ object ChatHistoryStore {
 
     /** Deletes the saved history (queued after any pending save). */
     fun clear(context: Context) {
-        val filesDir = context.applicationContext.filesDir
+        val file = historyFile(context)
         writer.execute {
             try {
-                File(filesDir, HISTORY_FILE_NAME).delete()
+                file.delete()
             } catch (ignored: Exception) {
                 // Nothing to delete then.
             }

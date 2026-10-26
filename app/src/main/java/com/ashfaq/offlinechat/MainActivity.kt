@@ -3,6 +3,7 @@ package com.ashfaq.offlinechat
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.ColorStateList
 import android.content.pm.PackageManager
@@ -40,6 +41,7 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -254,6 +256,12 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private var profilePhotoPreview: ImageView? = null
     private var pendingProfilePhotoFile: File? = null
 
+    // Export / backup / restore (Update #22): the "Working…" dialog
+    // up while ChatBackup builds, checks or installs a file on its
+    // background thread. Non-null only while one of the three flows
+    // is running; the callbacks dismiss it again.
+    private var workingDialog: AlertDialog? = null
+
     // Waiting-for-a-fix state: the manager and listener of the one
     // single update that may be in flight, and the providers still
     // left to try when it times out. All null/empty when idle.
@@ -344,6 +352,19 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     ) { uri ->
         if (uri != null && !closing) {
             stageOwnProfilePhoto(uri)
+        }
+    }
+
+    // The backup picker (Update #22): the system document picker
+    // again, this time choosing the .zip an earlier backup was
+    // saved as. A cancelled pick stays silent; a picked file is
+    // extracted and checked in the background (see onBackupPicked)
+    // before anything on this phone is touched.
+    private val restorePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null && !closing) {
+            onBackupPicked(uri)
         }
     }
 
@@ -504,7 +525,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
      * lives here now, each item calling the very same handler or
      * dialog its old button called. The Walkie-Talkie item (update
      * #14) opens its own dialog, described below; the Profile item
-     * (update #21) opens the own-profile dialog further down.
+     * (update #21) opens the own-profile dialog further down; the
+     * Export, Backup and Restore items (update #22) run the flows
+     * in the export/backup section below.
      */
     private fun showOverflowMenu(anchor: View) {
         val itemName = 1
@@ -515,6 +538,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         val itemClear = 6
         val itemWalkie = 7
         val itemProfile = 8
+        val itemExport = 9
+        val itemBackup = 10
+        val itemRestore = 11
         val popup = PopupMenu(this, anchor)
         popup.menu.add(0, itemName, 0, R.string.your_name)
         popup.menu.add(0, itemProfile, 1, R.string.profile)
@@ -523,7 +549,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         popup.menu.add(0, itemPinLock, 4, R.string.pin_lock_title)
         popup.menu.add(0, itemThemes, 5, R.string.color_themes)
         popup.menu.add(0, itemWalkie, 6, R.string.walkie_talkie)
-        popup.menu.add(0, itemClear, 7, R.string.clear_chat)
+        popup.menu.add(0, itemExport, 7, R.string.export_chat)
+        popup.menu.add(0, itemBackup, 8, R.string.backup_chat)
+        popup.menu.add(0, itemRestore, 9, R.string.restore_backup)
+        popup.menu.add(0, itemClear, 10, R.string.clear_chat)
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 itemName -> showNameDialog()
@@ -533,6 +562,11 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
                 itemPinLock -> showPinLockMenu()
                 itemThemes -> showThemesDialog()
                 itemWalkie -> showWalkieTalkieDialog()
+                itemExport -> onExportChatClicked()
+                itemBackup -> onBackupChatClicked()
+                itemRestore -> restorePickerLauncher.launch(
+                    arrayOf("application/zip")
+                )
                 itemClear -> confirmClearChat()
             }
             true
@@ -841,6 +875,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     override fun onDestroy() {
         closing = true
         requestDialog?.dismiss()
+        dismissWorkingDialog()
         // Dismissing the walkie-talkie dialog also ends a talk in
         // progress, through its dismiss listener.
         walkieDialog?.dismiss()
@@ -2565,6 +2600,198 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
+    }
+
+    // ---------- Export, backup & restore (Update #22) ----------
+
+    /**
+     * The Export chat overflow-menu item: the saved chat as a
+     * readable plain-text transcript (see [ChatBackup.buildTranscript]),
+     * written to a file in the background and handed to the share
+     * sheet, so it can go anywhere — WhatsApp, a file manager,
+     * another phone. An empty chat just says so.
+     */
+    private fun onExportChatClicked() {
+        if (closing) return
+        val history = ChatHistoryStore.load(this)
+        if (history.isEmpty()) {
+            Toast.makeText(this, R.string.history_empty, Toast.LENGTH_SHORT).show()
+            return
+        }
+        showWorkingDialog()
+        ChatBackup.exportChat(
+            this, history, chatManager.displayBaseName(), connectedPeerName
+        ) { file ->
+            dismissWorkingDialog()
+            if (!closing) {
+                if (file != null) {
+                    shareFile(
+                        file, "text/plain",
+                        R.string.share_export_title, R.string.export_failed
+                    )
+                } else {
+                    Toast.makeText(
+                        this, R.string.export_failed, Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+    /**
+     * The Backup chat overflow-menu item: the whole saved chat —
+     * history file and media together, as one .zip (see
+     * [ChatBackup]) — built in the background and shared the same
+     * way as an export, so the user can keep it wherever they keep
+     * important files. Restoring it later brings the chat back
+     * whole, on this phone or another one.
+     */
+    private fun onBackupChatClicked() {
+        if (closing) return
+        if (ChatHistoryStore.load(this).isEmpty()) {
+            Toast.makeText(this, R.string.history_empty, Toast.LENGTH_SHORT).show()
+            return
+        }
+        showWorkingDialog()
+        ChatBackup.backupChat(this) { file ->
+            dismissWorkingDialog()
+            if (!closing) {
+                if (file != null) {
+                    shareFile(
+                        file, "application/zip",
+                        R.string.share_backup_title, R.string.backup_failed
+                    )
+                } else {
+                    Toast.makeText(
+                        this, R.string.backup_failed, Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+    /**
+     * A backup file was picked for restoring. It is extracted and
+     * checked in the background first; only a backup that proves
+     * sound earns the confirm dialog, and nothing on this phone has
+     * been touched yet at that point.
+     */
+    private fun onBackupPicked(uri: Uri) {
+        showWorkingDialog()
+        ChatBackup.extractBackup(this, uri) { staging ->
+            dismissWorkingDialog()
+            if (closing) {
+                if (staging != null) ChatBackup.discardStaging(staging)
+            } else if (staging == null) {
+                Toast.makeText(
+                    this, R.string.restore_failed, Toast.LENGTH_LONG
+                ).show()
+            } else {
+                confirmRestore(staging)
+            }
+        }
+    }
+
+    /**
+     * The restore confirm: deliberately blunt, because the restore
+     * REPLACES the chat on this phone — there is no merge and no
+     * undo. Cancelling (button or Back) throws the checked backup
+     * away and leaves the chat exactly as it was.
+     */
+    private fun confirmRestore(staging: ChatBackup.Staging) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.restore_title)
+            .setMessage(R.string.restore_message)
+            .setPositiveButton(R.string.restore_confirm) { _, _ ->
+                showWorkingDialog()
+                ChatBackup.finishRestore(this, staging) { messages ->
+                    dismissWorkingDialog()
+                    if (!closing) {
+                        if (messages != null) {
+                            applyRestoredChat(messages)
+                            Toast.makeText(
+                                this, R.string.restore_done, Toast.LENGTH_SHORT
+                            ).show()
+                        } else {
+                            Toast.makeText(
+                                this, R.string.restore_failed, Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                }
+            }
+            .setNegativeButton(android.R.string.cancel) { _, _ ->
+                ChatBackup.discardStaging(staging)
+            }
+            .setOnCancelListener {
+                ChatBackup.discardStaging(staging)
+            }
+            .show()
+    }
+
+    /**
+     * Puts a restored chat on screen: any search filter and pending
+     * reply belong to the old chat and go, the rows are replaced,
+     * and new messages continue the local ids after the highest one
+     * the restored history already uses — exactly like startup.
+     */
+    private fun applyRestoredChat(messages: List<ChatMessage>) {
+        closeSearch()
+        clearPendingQuote()
+        adapter.clearTransferProgress()
+        adapter.setMessages(messages)
+        nextLocalId = (messages.maxOfOrNull { it.localId } ?: 0L) + 1L
+        if (messages.isNotEmpty()) {
+            recyclerMessages.scrollToPosition(messages.size - 1)
+        }
+    }
+
+    /** Hands a built file to the share sheet through FileProvider. */
+    private fun shareFile(
+        file: File,
+        mimeType: String,
+        chooserTitleRes: Int,
+        failureRes: Int
+    ) {
+        try {
+            val uri = FileProvider.getUriForFile(
+                this, packageName + ".fileprovider", file
+            )
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = mimeType
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, getString(chooserTitleRes)))
+        } catch (e: Exception) {
+            Toast.makeText(this, failureRes, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /**
+     * The "Working…" dialog over the backup flows' background work:
+     * a plain spinner, not cancellable — the work is short and the
+     * callbacks always dismiss it again.
+     */
+    private fun showWorkingDialog() {
+        if (closing || workingDialog != null) return
+        val density = resources.displayMetrics.density
+        val side = (24 * density).toInt()
+        val progress = ProgressBar(this).apply {
+            isIndeterminate = true
+            setPadding(side, side / 2, side, side / 2)
+        }
+        workingDialog = AlertDialog.Builder(this)
+            .setTitle(R.string.working)
+            .setView(progress)
+            .setCancelable(false)
+            .create()
+        workingDialog?.show()
+    }
+
+    private fun dismissWorkingDialog() {
+        workingDialog?.dismiss()
+        workingDialog = null
     }
 
     // ---------- Profiles (Update #21) ----------

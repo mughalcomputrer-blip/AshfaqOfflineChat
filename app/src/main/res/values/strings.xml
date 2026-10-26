@@ -151,6 +151,21 @@
 <string name="profile_you">%1$s (You)</string>
 <string name="profile_photo_failed">That photo could not be used. Please pick another.</string>
 
+<string name="export_chat">Export chat</string>
+<string name="backup_chat">Backup chat</string>
+<string name="restore_backup">Restore backup</string>
+<string name="history_empty">The chat is empty — there is nothing to save yet.</string>
+<string name="working">Working…</string>
+<string name="share_export_title">Share chat export</string>
+<string name="share_backup_title">Share chat backup</string>
+<string name="export_failed">The export could not be created.</string>
+<string name="backup_failed">The backup could not be created.</string>
+<string name="restore_title">Restore backup?</string>
+<string name="restore_message">This will REPLACE your current chat with the chat from the backup. Every message you see now will be removed from this phone. This cannot be undone.</string>
+<string name="restore_confirm">Restore</string>
+<string name="restore_done">Chat restored from the backup.</string>
+<string name="restore_failed">That backup could not be restored. Your current chat was not changed.</string>
+
 <string name="color_themes">Color theme</string>
 <string name="theme_ocean">Ocean</string>
 <string name="theme_forest">Forest</string>
