@@ -54,6 +54,7 @@
 <string name="delete_message_confirm">Delete</string>
 <string name="message_deleted">🚫 This message was deleted</string>
 <string name="message_edited">edited</string>
+<string name="transfer_percent">%1$d%%</string>
 <string name="not_connected_edit">Not connected. Message not edited.</string>
 <string name="not_connected_delete">Not connected. Message not deleted.</string>
 <string name="forward">Forward</string>

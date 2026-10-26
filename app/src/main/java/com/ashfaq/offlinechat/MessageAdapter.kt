@@ -3,6 +3,7 @@ package com.ashfaq.offlinechat
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Typeface
@@ -17,6 +18,7 @@ import android.webkit.MimeTypeMap
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
@@ -45,6 +47,18 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
     private var visibleMessages: List<ChatMessage> = emptyList()
 
     private val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
+
+    // Transfer progress, by the local id of the message whose file
+    // is on its way: how far its transfer has got, in percent
+    // (0–100). TRANSIENT by design — it is never written into a
+    // ChatMessage and never saved to the history: a transfer does
+    // not survive an app restart, so on a freshly loaded chat no
+    // row has an entry here and no bar shows. Entries appear when
+    // the screen reports a transfer running for a message (its own
+    // file send, or a received file whose bubble is already up as
+    // a "receiving" placeholder) and are removed when the transfer
+    // ends, whichever way it ends.
+    private val transferProgress = mutableMapOf<Long, Int>()
 
     /**
      * Called when the user long-presses a message (the screen shows
@@ -85,6 +99,11 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
         val locationTitleText: TextView = view.findViewById(R.id.locationTitleText)
         val locationCoordsText: TextView = view.findViewById(R.id.locationCoordsText)
         val reactionsText: TextView = view.findViewById(R.id.reactionsText)
+        val progressRow: View = view.findViewById(R.id.progressRow)
+        val transferProgressBar: ProgressBar =
+            view.findViewById(R.id.transferProgressBar)
+        val transferPercentText: TextView =
+            view.findViewById(R.id.transferPercentText)
         val editedText: TextView = view.findViewById(R.id.editedText)
         val timeText: TextView = view.findViewById(R.id.timeText)
         val ticksText: TextView = view.findViewById(R.id.ticksText)
@@ -416,6 +435,57 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
                 holder.bubble.setOnClickListener(null)
             }
         }
+
+        // The transfer progress bar under the content, on a media
+        // message whose file is still on its way — our own send
+        // going out, or an incoming file whose bubble is already up
+        // as a "receiving" placeholder. The state is the transient
+        // [transferProgress] map (never the message itself), so a
+        // row bound from history never shows one. Bar and percent
+        // follow the bubble's side like everything else here: the
+        // accent on a received bubble, the bubble's own text color
+        // on a sent one.
+        val progress = if (message.localId != 0L) {
+            transferProgress[message.localId]
+        } else {
+            null
+        }
+        val showProgress = progress != null && !message.deleted &&
+            (message.type == ChatMessage.Type.VOICE ||
+                message.type == ChatMessage.Type.PHOTO ||
+                message.type == ChatMessage.Type.VIDEO ||
+                message.type == ChatMessage.Type.FILE)
+        if (showProgress && progress != null) {
+            holder.progressRow.visibility = View.VISIBLE
+            holder.transferProgressBar.progress = progress
+            holder.transferPercentText.text =
+                context.getString(R.string.transfer_percent, progress)
+            val progressTint = if (message.isSent) {
+                ContextCompat.getColor(context, R.color.bubble_sent_text)
+            } else {
+                AppColors.accent(context)
+            }
+            holder.transferProgressBar.progressTintList =
+                ColorStateList.valueOf(progressTint)
+            holder.transferPercentText.setTextColor(
+                if (message.isSent) {
+                    ContextCompat.getColor(context, R.color.bubble_sent_text)
+                } else {
+                    AppColors.textSecondary(context)
+                }
+            )
+        } else {
+            holder.progressRow.visibility = View.GONE
+            holder.transferPercentText.text = null
+        }
+        // A file's size is only known once the file is here, so
+        // while it is still on its way the size line stays hidden
+        // rather than showing a meaningless "0 B" (the name above
+        // it already says what is coming).
+        if (message.type == ChatMessage.Type.FILE) {
+            holder.fileSizeText.visibility =
+                if (showProgress) View.GONE else View.VISIBLE
+        }
     }
 
     override fun getItemCount(): Int = visibleMessages.size
@@ -455,6 +525,96 @@ class MessageAdapter : RecyclerView.Adapter<MessageAdapter.MessageViewHolder>() 
             it.localId == localId && it.isSent
         }
         if (visibleIndex >= 0) notifyItemChanged(visibleIndex)
+        return true
+    }
+
+    // ---------- Transfer progress ----------
+
+    /**
+     * Reports how far the transfer of the message with [localId]
+     * has got, in percent (clamped to 0–100), and redraws its row.
+     * Progress reports can arrive in a flood (Nearby updates as
+     * chunks land, and a group send reports once per phone), so
+     * this is the throttle: a report that does not RAISE the shown
+     * integer percent changes nothing and redraws nothing — the
+     * bar only ever moves up, and only when the number really
+     * moved. (A transfer never restarts under the same id, so a
+     * lower report can only be another group member's slower hop
+     * of the same send — the bar keeps the furthest hop's number.)
+     */
+    fun setProgress(localId: Long, percent: Int) {
+        if (localId == 0L) return
+        val clamped = percent.coerceIn(0, 100)
+        val current = transferProgress[localId]
+        if (current != null && clamped <= current) return
+        transferProgress[localId] = clamped
+        val visibleIndex = visibleMessages.indexOfFirst { it.localId == localId }
+        if (visibleIndex >= 0) notifyItemChanged(visibleIndex)
+    }
+
+    /**
+     * Ends the progress shown for the message with [localId] (its
+     * transfer finished, one way or the other) and redraws its row.
+     */
+    fun clearProgress(localId: Long) {
+        if (localId == 0L) return
+        if (transferProgress.remove(localId) == null) return
+        val visibleIndex = visibleMessages.indexOfFirst { it.localId == localId }
+        if (visibleIndex >= 0) notifyItemChanged(visibleIndex)
+    }
+
+    /**
+     * Drops every in-flight progress state at once (the connection
+     * is gone, so no transfer is running any more) and redraws.
+     */
+    fun clearTransferProgress() {
+        if (transferProgress.isEmpty()) return
+        transferProgress.clear()
+        notifyDataSetChanged()
+    }
+
+    /** The shown message with this local id, if there is one. */
+    fun messageByLocalId(localId: Long): ChatMessage? =
+        messages.firstOrNull { it.localId == localId }
+
+    /**
+     * Swaps the message with [localId] for [replacement], in place:
+     * same row, new content. Used when a "receiving" placeholder is
+     * filled by the file that just finished arriving — the caller
+     * builds the finished message from the placeholder, so its
+     * sender, quote, id and any reactions it collected on the way
+     * carry over. Returns false when no message has that id.
+     */
+    fun replaceMessage(localId: Long, replacement: ChatMessage): Boolean {
+        if (localId == 0L) return false
+        val index = messages.indexOfFirst { it.localId == localId }
+        if (index < 0) return false
+        messages[index] = replacement
+        refreshVisible()
+        // The visible slice holds the same objects as the full list,
+        // so the row is found by the object itself (the replacement
+        // may carry local id 0, which many rows share).
+        val visibleIndex = visibleMessages.indexOfFirst { it === replacement }
+        if (visibleIndex >= 0) notifyItemChanged(visibleIndex)
+        return true
+    }
+
+    /**
+     * Takes the message with [localId] off the screen entirely.
+     * Used for a "receiving" placeholder whose file never arrived:
+     * the row was never saved to the history, so removing it here
+     * leaves no trace anywhere. Returns false when no message has
+     * that id.
+     */
+    fun removeMessage(localId: Long): Boolean {
+        if (localId == 0L) return false
+        val index = messages.indexOfFirst { it.localId == localId }
+        if (index < 0) return false
+        val visibleIndex = visibleMessages.indexOfFirst { it.localId == localId }
+        messages.removeAt(index)
+        transferProgress.remove(localId)
+        refreshVisible()
+        if (visibleIndex >= 0) notifyItemRemoved(visibleIndex)
         return true
     }
 

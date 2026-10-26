@@ -100,6 +100,17 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     // startApp, so ids never repeat within the saved chat.
     private var nextLocalId = 1L
 
+    // Files from other phones that are still arriving, while their
+    // bubble is already on screen as a "receiving" placeholder:
+    // Nearby payload id -> the placeholder row's local id. The
+    // placeholder borrows an id from the same counter (its own sends
+    // and placeholders can then never share one, so the adapter's
+    // progress state stays unambiguous); the finished message drops
+    // it again (received messages carry no local id). A placeholder
+    // is never written to the history — only the finished message
+    // is, when its transfer completes.
+    private val receivingPlaceholders = mutableMapOf<Long, Long>()
+
     // Voice recording state.
     private var recorder: MediaRecorder? = null
     private var recordingFile: File? = null
@@ -2423,6 +2434,16 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     override fun onDisconnected() {
         if (closing) return
         requestDialog?.dismiss()
+        // Transfers died with the connection: a "receiving"
+        // placeholder can never be filled now, so its row goes away
+        // (ChatManager also ends each one through onReceiveFailed —
+        // whichever runs first wins, the other finds nothing), and
+        // no send is still in flight, so every progress bar goes.
+        for (localId in receivingPlaceholders.values.toList()) {
+            adapter.removeMessage(localId)
+        }
+        receivingPlaceholders.clear()
+        adapter.clearTransferProgress()
         // Any walkie-talkie talk died with the connection; an open
         // dialog just loses its button (refreshWalkieDialog shows
         // the not-connected line), it is not closed from under the
@@ -2519,11 +2540,143 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
     override fun onMessageDelivered(localId: Long) {
         if (closing) return
+        // The transfer is done, so its progress bar is done too.
+        adapter.clearProgress(localId)
         // Put the second tick on the message, and save the history so
         // the ticks are still right after the app is reopened.
         if (adapter.markDelivered(localId)) {
             ChatHistoryStore.save(this, adapter.snapshot())
         }
+    }
+
+    override fun onSendProgress(localId: Long, percent: Int) {
+        if (closing) return
+        adapter.setProgress(localId, percent)
+    }
+
+    override fun onSendProgressEnded(localId: Long) {
+        if (closing) return
+        // The send failed or was cancelled (the error itself comes
+        // through onError, as before): its bar simply goes away.
+        adapter.clearProgress(localId)
+    }
+
+    override fun onReceiveStarted(
+        payloadId: Long,
+        type: ChatMessage.Type,
+        senderName: String?,
+        fileName: String?,
+        voiceDurationSeconds: Int,
+        quotedSender: String?,
+        quotedText: String?,
+        wireId: String?,
+        forwarded: Boolean,
+        forwardedFrom: String?
+    ) {
+        if (closing) return
+        // The file is on its way and its info was already in, so its
+        // bubble goes up at once — as a placeholder with no file yet,
+        // wearing the progress bar the transfer updates fill. It is
+        // deliberately NOT saved to the history: only the finished
+        // message is, in onReceiveCompleted. (If a later save for
+        // some other message sweeps the placeholder into a snapshot
+        // anyway, the history load drops it again — a media entry
+        // whose file does not exist is skipped there.)
+        val localId = nextLocalId++
+        receivingPlaceholders[payloadId] = localId
+        val placeholder = ChatMessage(
+            text = "",
+            isSent = false,
+            type = type,
+            durationSeconds = if (type == ChatMessage.Type.VOICE) {
+                voiceDurationSeconds
+            } else {
+                0
+            },
+            fileName = if (type == ChatMessage.Type.FILE) fileName else null,
+            senderName = senderName,
+            quotedSender = quotedSender,
+            quotedText = quotedText,
+            wireId = wireId,
+            forwarded = forwarded,
+            forwardedFrom = forwardedFrom,
+            localId = localId
+        )
+        adapter.addMessage(placeholder)
+        recyclerMessages.scrollToPosition(adapter.itemCount - 1)
+        adapter.setProgress(localId, 0)
+    }
+
+    override fun onReceiveProgress(payloadId: Long, percent: Int) {
+        if (closing) return
+        val localId = receivingPlaceholders[payloadId] ?: return
+        adapter.setProgress(localId, percent)
+    }
+
+    override fun onReceiveCompleted(
+        payloadId: Long,
+        filePath: String,
+        fileName: String,
+        fileSizeBytes: Long,
+        durationSeconds: Int
+    ) {
+        if (closing) return
+        val localId = receivingPlaceholders.remove(payloadId) ?: return
+        val placeholder = adapter.messageByLocalId(localId)
+        adapter.clearProgress(localId)
+        if (placeholder == null) return
+        if (placeholder.deleted) {
+            // The author deleted this message for everyone while it
+            // was still arriving here: the placeholder row (already
+            // a "deleted" bubble) stands, and the file that just
+            // landed goes away again instead of filling it.
+            try {
+                File(filePath).delete()
+            } catch (ignored: Exception) {
+                // Best effort, like every other media delete.
+            }
+            ChatHistoryStore.save(this, adapter.snapshot())
+            return
+        }
+        // The finished message is the placeholder plus its file —
+        // built by copy, so the sender, quote, message id and any
+        // reactions the row collected while the file was on its way
+        // all carry over. The borrowed local id is dropped again:
+        // received messages carry none.
+        val finished = when (placeholder.type) {
+            ChatMessage.Type.VOICE -> placeholder.copy(
+                audioPath = filePath,
+                durationSeconds = durationSeconds,
+                localId = 0
+            )
+            ChatMessage.Type.PHOTO -> placeholder.copy(
+                imagePath = filePath,
+                localId = 0
+            )
+            ChatMessage.Type.VIDEO -> placeholder.copy(
+                videoPath = filePath,
+                durationSeconds = durationSeconds,
+                localId = 0
+            )
+            ChatMessage.Type.FILE -> placeholder.copy(
+                filePath = filePath,
+                fileName = fileName,
+                fileSizeBytes = fileSizeBytes,
+                localId = 0
+            )
+            else -> placeholder
+        }
+        adapter.replaceMessage(localId, finished)
+        // Only now — the message is whole — does it reach the history.
+        ChatHistoryStore.save(this, adapter.snapshot())
+    }
+
+    override fun onReceiveFailed(payloadId: Long) {
+        if (closing) return
+        // The file will never arrive: its placeholder row goes away
+        // again. It was never saved, so nothing else needs undoing.
+        val localId = receivingPlaceholders.remove(payloadId) ?: return
+        adapter.removeMessage(localId)
     }
 
     override fun onVoiceMessageReceived(

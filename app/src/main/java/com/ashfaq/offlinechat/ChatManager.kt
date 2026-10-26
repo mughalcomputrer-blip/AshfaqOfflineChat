@@ -143,6 +143,30 @@ import java.util.UUID
  * segment safely (a photo's name must end in ".jpg", a file's
  * name would swallow the segment). A forward never carries the
  * original's quote or reactions: it starts life clean.
+ *
+ * Transfer progress: while a voice, photo, video or file is being
+ * sent or received, the bubble shows how far the transfer has got
+ * (see [Listener.onSendProgress] and the onReceive... callbacks).
+ * Nothing about this rides the wire — Nearby reports every file
+ * payload's progress locally in onPayloadTransferUpdate — so older
+ * app versions are unaffected. On the sending side only our own
+ * file sends are tracked (a second map next to [outgoingPayloads]);
+ * the bar ends with the delivered tick on success, or with
+ * [Listener.onSendProgressEnded] on failure. On the receiving side,
+ * when a file payload starts and its info text has already arrived
+ * (the normal order: the info always goes first), the screen is
+ * told at once, so it can show the bubble as a "receiving"
+ * placeholder and fill it with progress until the transfer
+ * finishes; the finished file is then handed over through
+ * [Listener.onReceiveCompleted] INSTEAD of the usual
+ * onVoiceMessageReceived / onPhotoMessageReceived / ... callbacks,
+ * and a transfer that fails, is cancelled, or loses its sender
+ * ends the placeholder through [Listener.onReceiveFailed]. A file
+ * that starts before its info (or while another file from the
+ * same phone is already showing progress) keeps the old behaviour
+ * exactly: no placeholder, the bubble appears at completion. The
+ * hub's receive-then-relay flow is untouched by all of this — the
+ * relay starts at completion, as before, and shows no progress.
  */
 class ChatManager(
     context: Context,
@@ -305,6 +329,87 @@ class ChatManager(
          * This is local bookkeeping only — nothing extra goes on the wire.
          */
         fun onMessageDelivered(localId: Long) {}
+
+        /**
+         * Progress of one of our own file sends: the file payload
+         * of the message sent with [localId] is [percent] percent
+         * transferred (0–100). Reported only while the transfer is
+         * running and only for voice, photo, video and file sends —
+         * text messages are instant and never report. The bar this
+         * drives ends when the message is delivered
+         * ([onMessageDelivered]) or the send ends without success
+         * ([onSendProgressEnded]). Display-only: nothing extra goes
+         * on the wire for it.
+         */
+        fun onSendProgress(localId: Long, percent: Int) {}
+
+        /**
+         * One of our own file sends (the message sent with
+         * [localId]) ended without success — its transfer failed
+         * or was cancelled — so any progress shown for it is over.
+         * The failure itself is still reported through [onError],
+         * exactly as before.
+         */
+        fun onSendProgressEnded(localId: Long) {}
+
+        /**
+         * A file from another phone has started arriving AND its
+         * info text (kind, sender, quote, message id) was already
+         * in, so the screen can show the message's bubble at once
+         * as a "receiving" placeholder and fill it with progress
+         * ([onReceiveProgress]) until the transfer finishes.
+         * [payloadId] names the transfer in the callbacks that
+         * follow. [type] is the kind of message coming;
+         * [fileName] is set for a general file (and a voice note),
+         * [voiceDurationSeconds] for a voice note (0 when the info
+         * carried none). The remaining parameters mean what they
+         * mean for the on...MessageReceived callbacks. A file that
+         * starts before its info gets NO such call: it is reported
+         * whole at completion, as before this feature existed.
+         */
+        fun onReceiveStarted(
+            payloadId: Long,
+            type: ChatMessage.Type,
+            senderName: String?,
+            fileName: String?,
+            voiceDurationSeconds: Int,
+            quotedSender: String?,
+            quotedText: String?,
+            wireId: String?,
+            forwarded: Boolean = false,
+            forwardedFrom: String? = null
+        ) {}
+
+        /**
+         * The transfer named by [payloadId] (see [onReceiveStarted])
+         * is [percent] percent in (0–100). Display-only.
+         */
+        fun onReceiveProgress(payloadId: Long, percent: Int) {}
+
+        /**
+         * The transfer named by [payloadId] finished: the file is
+         * saved at [filePath] under the name [fileName] and is
+         * [fileSizeBytes] big; [durationSeconds] is its length for
+         * a voice note or a video (0 for a photo or a file). This
+         * REPLACES the matching on...MessageReceived callback for
+         * this message — the placeholder the screen showed becomes
+         * the real message, and only now is it saved to history.
+         */
+        fun onReceiveCompleted(
+            payloadId: Long,
+            filePath: String,
+            fileName: String,
+            fileSizeBytes: Long,
+            durationSeconds: Int
+        ) {}
+
+        /**
+         * The transfer named by [payloadId] will never finish —
+         * it failed, was cancelled, or the sending phone left — so
+         * the placeholder shown for it goes away again. Nothing of
+         * it was ever saved to history.
+         */
+        fun onReceiveFailed(payloadId: Long) {}
 
         /**
          * A voice message arrived; [filePath] points to our own copy
@@ -494,6 +599,18 @@ class ChatManager(
     // therefore never reported as deliveries.
     private val outgoingPayloads = mutableMapOf<Long, Long>()
 
+    // The subset of [outgoingPayloads] that are FILE payloads (the
+    // file of a voice, photo, video or file message of ours):
+    // Nearby payload id -> the message's local id, kept so transfer
+    // progress can be reported for exactly the sends whose bubble
+    // shows a progress bar. Text payloads are never in here (they
+    // are instant). The host's relays are never in here either
+    // (their local id is 0 — no bubble of the host's waits on them).
+    // An entry leaves with its transfer: on success (the delivered
+    // tick ends the bar), on failure or cancel (reported through
+    // Listener.onSendProgressEnded), or in stopEverything.
+    private val outgoingFilePayloads = mutableMapOf<Long, Long>()
+
     // Payloads of our own typing signals ("#TYPE#...") that Nearby
     // has not finished sending yet — ours, and the hub's relays of
     // other members' signals. A typing signal is invisible and
@@ -510,6 +627,16 @@ class ChatManager(
     // Which endpoint each incoming file payload came from, so its pieces
     // can be cleaned up when that phone leaves the group.
     private val filePayloadEndpoints = mutableMapOf<Long, String>()
+
+    // Incoming file payloads whose bubble the screen is already
+    // showing as a "receiving" placeholder: Nearby payload id ->
+    // the endpoint the file is coming from. A payload joins when it
+    // starts and its info text is already in (see onPayloadReceived);
+    // at most one per endpoint, like [pendingFiles]. An entry
+    // leaves when the transfer finishes (Listener.onReceiveCompleted
+    // replaces the usual arrival callback), fails or is cancelled,
+    // or the sending phone leaves (both Listener.onReceiveFailed).
+    private val incomingProgressPayloads = mutableMapOf<Long, String>()
 
     // What kind of file is on its way, told to us by the small info
     // message the sender sends just before every file. Kept per sending
@@ -1595,7 +1722,12 @@ class ChatManager(
             if (errorMessage != null) listener.onError(errorMessage)
             return false
         }
-        if (localId != 0L) outgoingPayloads[filePayload.id] = localId
+        if (localId != 0L) {
+            outgoingPayloads[filePayload.id] = localId
+            // Our own file send also reports its transfer progress,
+            // so its bubble can show a progress bar while it goes.
+            outgoingFilePayloads[filePayload.id] = localId
+        }
         if (messageIdText != null) {
             client.sendPayload(
                 targets, Payload.fromBytes(messageIdText.toByteArray(Charsets.UTF_8))
@@ -1628,12 +1760,14 @@ class ChatManager(
         activeRequestEndpointId = null
         incomingFilePayloads.clear()
         filePayloadEndpoints.clear()
+        incomingProgressPayloads.clear()
         pendingFiles.clear()
         pendingQuotes.clear()
         pendingMediaInfos.clear()
         // Transfers that never finished will never report now; their
         // messages simply keep the single "sent" tick.
         outgoingPayloads.clear()
+        outgoingFilePayloads.clear()
         typingPayloadIds.clear()
         // Any live walkie-talkie talk dies with the connection:
         // our capture stops and a playing talk is cut off.
@@ -1946,6 +2080,20 @@ class ChatManager(
                     iterator.remove()
                 }
             }
+            // A "receiving" placeholder for one of this phone's
+            // files can never be filled now that it is gone; the
+            // screen takes it away again, like a failed transfer.
+            // (Nearby may still report the transfer's own failure
+            // afterwards — the entry is gone from the map by then,
+            // so the placeholder is only ever ended once.)
+            val progressIterator = incomingProgressPayloads.entries.iterator()
+            while (progressIterator.hasNext()) {
+                val entry = progressIterator.next()
+                if (entry.value == endpointId) {
+                    progressIterator.remove()
+                    listener.onReceiveFailed(entry.key)
+                }
+            }
             when (role) {
                 Role.HUB -> {
                     // One member left; the group carries on.
@@ -1978,6 +2126,40 @@ class ChatManager(
                     // finishes with SUCCESS in onPayloadTransferUpdate.
                     incomingFilePayloads[payload.id] = payload
                     filePayloadEndpoints[payload.id] = endpointId
+                    // When the file's info text is already in (the
+                    // normal order — every sender sends it first),
+                    // the screen can show the bubble at once as a
+                    // "receiving" placeholder and fill it with this
+                    // transfer's progress. The info, quote and
+                    // message id are only PEEKED here: the completion
+                    // in onPayloadTransferUpdate still takes them out
+                    // of their maps, exactly as before. At most one
+                    // placeholder per sending phone (pendingFiles is
+                    // single-slot per endpoint too); a file that
+                    // starts before its info, or while another file
+                    // from the same phone is already showing one,
+                    // keeps the old behaviour — no placeholder, the
+                    // bubble appears at completion.
+                    val info = pendingFiles[endpointId]
+                    if (info != null &&
+                        !incomingProgressPayloads.containsValue(endpointId)
+                    ) {
+                        incomingProgressPayloads[payload.id] = endpointId
+                        val quote = pendingQuotes[endpointId]
+                        val mediaInfo = pendingMediaInfos[endpointId]
+                        listener.onReceiveStarted(
+                            payload.id,
+                            chatTypeOf(info.kind),
+                            info.senderName,
+                            info.fileName,
+                            info.voiceDurationSeconds ?: 0,
+                            quote?.sender,
+                            quote?.text,
+                            mediaInfo?.wireId,
+                            mediaInfo?.forwarded ?: false,
+                            mediaInfo?.forwardedFrom
+                        )
+                    }
                 }
                 Payload.Type.BYTES -> {
                     val bytes = payload.asBytes() ?: return
@@ -2173,13 +2355,29 @@ class ChatManager(
             update: PayloadTransferUpdate
         ) {
             if (!connectedEndpoints.containsKey(endpointId)) return
-            if (update.status == PayloadTransferUpdate.Status.FAILURE) {
+            if (update.status == PayloadTransferUpdate.Status.FAILURE ||
+                update.status == PayloadTransferUpdate.Status.CANCELED
+            ) {
+                // A cancel gets the same quiet cleanup as a failure
+                // (before this feature it was not handled at all, and
+                // a half-finished transfer's pieces lingered until
+                // the next full stop), but it is never reported as an
+                // error: a cancel is usually our own disconnect or
+                // the other phone going away, both already signalled
+                // their own way.
+                val failed = update.status == PayloadTransferUpdate.Status.FAILURE
                 val wasIncoming = incomingFilePayloads.remove(update.payloadId) != null
                 filePayloadEndpoints.remove(update.payloadId)
                 // A failed send of ours is forgotten here; its message
                 // simply never earns the second tick (the error below
                 // is the same feedback as before).
                 outgoingPayloads.remove(update.payloadId)
+                // If it was one of our file sends, its progress bar
+                // is over too (a success ends the bar through the
+                // delivered tick instead).
+                outgoingFilePayloads.remove(update.payloadId)?.let { localId ->
+                    listener.onSendProgressEnded(localId)
+                }
                 // A failed typing signal is forgotten silently: it
                 // was never a message, so it must not produce the
                 // "could not be transferred" error below either.
@@ -2191,13 +2389,27 @@ class ChatManager(
                     pendingQuotes.remove(endpointId)
                     pendingMediaInfos.remove(endpointId)
                 }
-                if (!wasTyping) {
+                // A "receiving" placeholder for this file can never
+                // be filled now; the screen takes it away again. The
+                // half-arrived file itself is Nearby's own temp copy,
+                // discarded by Nearby — nothing of ours was ever
+                // saved for it, and nothing reaches the history.
+                if (incomingProgressPayloads.remove(update.payloadId) != null) {
+                    listener.onReceiveFailed(update.payloadId)
+                }
+                if (failed && !wasTyping) {
                     listener.onError("A message could not be transferred.")
                 }
             } else if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
                 // A typing signal that got through is simply
                 // forgotten; it was never tracked for the ticks.
                 typingPayloadIds.remove(update.payloadId)
+                // One of our own file sends got through (to the first
+                // phone, in a group); the delivered tick below is
+                // what ends its progress bar, so it leaves the
+                // progress map here and later per-phone updates for
+                // the same payload find nothing to report.
+                outgoingFilePayloads.remove(update.payloadId)
                 // One of our own messages finished transferring to the
                 // next phone. In a group send the payload goes to
                 // several phones with one payload id, so the FIRST
@@ -2208,6 +2420,13 @@ class ChatManager(
                 }
                 val filePayload = incomingFilePayloads.remove(update.payloadId)
                 filePayloadEndpoints.remove(update.payloadId)
+                // Whether the screen is showing a "receiving"
+                // placeholder for this file: it is completed through
+                // onReceiveCompleted below, instead of the usual
+                // arrival callbacks, and a file that cannot be saved
+                // ends it through onReceiveFailed.
+                val receiving =
+                    incomingProgressPayloads.remove(update.payloadId) != null
                 if (filePayload != null) {
                     // The info message said what kind of file this is. No
                     // info (or a lost one) keeps the old behavior: voice.
@@ -2224,14 +2443,27 @@ class ChatManager(
                     val forwardedFrom = mediaInfo?.forwardedFrom
                     when (info?.kind ?: IncomingFileKind.VOICE) {
                         IncomingFileKind.VOICE -> {
-                            val dest = saveReceivedVoiceFile(filePayload) ?: return
+                            val dest = saveReceivedVoiceFile(filePayload)
+                            if (dest == null) {
+                                if (receiving) {
+                                    listener.onReceiveFailed(update.payloadId)
+                                }
+                                return
+                            }
                             val duration = info?.voiceDurationSeconds
                                 ?: fileDurationSeconds(dest)
-                            listener.onVoiceMessageReceived(
-                                dest.absolutePath, duration, info?.senderName,
-                                quote?.sender, quote?.text, wireId,
-                                forwarded, forwardedFrom
-                            )
+                            if (receiving) {
+                                listener.onReceiveCompleted(
+                                    update.payloadId, dest.absolutePath,
+                                    dest.name, dest.length(), duration
+                                )
+                            } else {
+                                listener.onVoiceMessageReceived(
+                                    dest.absolutePath, duration, info?.senderName,
+                                    quote?.sender, quote?.text, wireId,
+                                    forwarded, forwardedFrom
+                                )
+                            }
                             if (role == Role.HUB) {
                                 relayVoiceFile(
                                     dest, duration, info?.senderName, endpointId,
@@ -2240,12 +2472,25 @@ class ChatManager(
                             }
                         }
                         IncomingFileKind.PHOTO -> {
-                            val dest = saveReceivedPhotoFile(filePayload) ?: return
-                            listener.onPhotoMessageReceived(
-                                dest.absolutePath, info?.senderName,
-                                quote?.sender, quote?.text, wireId,
-                                forwarded, forwardedFrom
-                            )
+                            val dest = saveReceivedPhotoFile(filePayload)
+                            if (dest == null) {
+                                if (receiving) {
+                                    listener.onReceiveFailed(update.payloadId)
+                                }
+                                return
+                            }
+                            if (receiving) {
+                                listener.onReceiveCompleted(
+                                    update.payloadId, dest.absolutePath,
+                                    dest.name, dest.length(), 0
+                                )
+                            } else {
+                                listener.onPhotoMessageReceived(
+                                    dest.absolutePath, info?.senderName,
+                                    quote?.sender, quote?.text, wireId,
+                                    forwarded, forwardedFrom
+                                )
+                            }
                             if (role == Role.HUB) {
                                 relayPhotoFile(
                                     dest, info?.senderName, endpointId, quote,
@@ -2254,12 +2499,25 @@ class ChatManager(
                             }
                         }
                         IncomingFileKind.FILE -> {
-                            val dest = saveReceivedFile(filePayload, info?.fileName) ?: return
-                            listener.onFileMessageReceived(
-                                dest.absolutePath, dest.name, dest.length(),
-                                info?.senderName, quote?.sender, quote?.text,
-                                wireId, forwarded, forwardedFrom
-                            )
+                            val dest = saveReceivedFile(filePayload, info?.fileName)
+                            if (dest == null) {
+                                if (receiving) {
+                                    listener.onReceiveFailed(update.payloadId)
+                                }
+                                return
+                            }
+                            if (receiving) {
+                                listener.onReceiveCompleted(
+                                    update.payloadId, dest.absolutePath,
+                                    dest.name, dest.length(), 0
+                                )
+                            } else {
+                                listener.onFileMessageReceived(
+                                    dest.absolutePath, dest.name, dest.length(),
+                                    info?.senderName, quote?.sender, quote?.text,
+                                    wireId, forwarded, forwardedFrom
+                                )
+                            }
                             if (role == Role.HUB) {
                                 relayFile(
                                     dest, info?.senderName, endpointId, quote,
@@ -2268,15 +2526,28 @@ class ChatManager(
                             }
                         }
                         IncomingFileKind.VIDEO -> {
-                            val dest = saveReceivedVideoFile(filePayload, info?.fileName) ?: return
+                            val dest = saveReceivedVideoFile(filePayload, info?.fileName)
+                            if (dest == null) {
+                                if (receiving) {
+                                    listener.onReceiveFailed(update.payloadId)
+                                }
+                                return
+                            }
                             // The video info carries no length, so it
                             // is read from the file we just saved.
                             val duration = fileDurationSeconds(dest)
-                            listener.onVideoMessageReceived(
-                                dest.absolutePath, duration, info?.senderName,
-                                quote?.sender, quote?.text, wireId,
-                                forwarded, forwardedFrom
-                            )
+                            if (receiving) {
+                                listener.onReceiveCompleted(
+                                    update.payloadId, dest.absolutePath,
+                                    dest.name, dest.length(), duration
+                                )
+                            } else {
+                                listener.onVideoMessageReceived(
+                                    dest.absolutePath, duration, info?.senderName,
+                                    quote?.sender, quote?.text, wireId,
+                                    forwarded, forwardedFrom
+                                )
+                            }
                             if (role == Role.HUB) {
                                 relayVideoFile(
                                     dest, info?.senderName, endpointId, quote,
@@ -2286,9 +2557,37 @@ class ChatManager(
                         }
                     }
                 }
+            } else if (update.status == PayloadTransferUpdate.Status.IN_PROGRESS) {
+                // A file payload on its way, in either direction:
+                // Nearby reports how much of it has gone. Only the
+                // transfers the screen shows a bar for are reported
+                // — one of our own file sends, or an incoming file
+                // whose bubble is already up as a placeholder. A
+                // transfer whose total size is not (yet) known
+                // reports nothing; its bar simply waits.
+                val totalBytes = update.totalBytes
+                if (totalBytes > 0) {
+                    val percent = ((update.bytesTransferred * 100) / totalBytes)
+                        .toInt().coerceIn(0, 100)
+                    outgoingFilePayloads[update.payloadId]?.let { localId ->
+                        listener.onSendProgress(localId, percent)
+                    }
+                    if (incomingProgressPayloads.containsKey(update.payloadId)) {
+                        listener.onReceiveProgress(update.payloadId, percent)
+                    }
+                }
             }
         }
     }
+
+    /** The chat-row kind an incoming file of this kind becomes. */
+    private fun chatTypeOf(kind: IncomingFileKind): ChatMessage.Type =
+        when (kind) {
+            IncomingFileKind.VOICE -> ChatMessage.Type.VOICE
+            IncomingFileKind.PHOTO -> ChatMessage.Type.PHOTO
+            IncomingFileKind.FILE -> ChatMessage.Type.FILE
+            IncomingFileKind.VIDEO -> ChatMessage.Type.VIDEO
+        }
 
     // ----- Host relaying of received files -----
     // The host re-sends a fully received file (its own saved copy) to all
