@@ -128,6 +128,8 @@
 <string name="walkie_start_failed">Could not start talking. Please try again.</string>
 <string name="walkie_mic_ready">Microphone ready — hold the button to talk.</string>
 
+<string name="typing_indicator">%1$s is typing…</string>
+
 <string name="color_themes">Color theme</string>
 <string name="theme_ocean">Ocean</string>
 <string name="theme_forest">Forest</string>

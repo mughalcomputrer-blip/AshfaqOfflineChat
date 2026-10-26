@@ -168,6 +168,33 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private var peerTalking = false
     private var peerTalkingName: String? = null
 
+    // Typing indicator state. Sending side: whether our last
+    // signal said "typing" (so the stop signal goes out exactly
+    // once, when the text is emptied or sent) and when the last
+    // start signal went out (the throttle — steady typing repeats
+    // its signal every couple of seconds, not per keystroke).
+    private var typingSignalSent = false
+    private var lastTypingSignalAt = 0L
+
+    // Receiving side: who is typing — their name, and the moment
+    // (uptimeMillis) their indicator expires. A typer who never
+    // sends a stop is forgotten when their time runs out; the one
+    // runnable below wakes up for the earliest expiry and tidies
+    // the map (see refreshTypingIndicator).
+    private val typingPeers = LinkedHashMap<String, Long>()
+    private val typingHandler = Handler(Looper.getMainLooper())
+    private val typingExpiryCheck = Runnable {
+        if (!closing) refreshTypingIndicator()
+    }
+
+    // The status line's real content — the last status set through
+    // setStatus — kept aside while a typing line borrows the line,
+    // so what comes back afterwards is the current status
+    // (connected, hosting, reconnecting…), never a stale copy.
+    private var currentStatusText: String = ""
+    private var currentStatusColorRes: Int = R.color.status_idle
+    private var typingStatusShown = false
+
     // Waiting-for-a-fix state: the manager and listener of the one
     // single update that may be in flight, and the providers still
     // left to try when it times out. All null/empty when idle.
@@ -300,6 +327,20 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonFind.setOnClickListener { onFindClicked() }
         buttonDisconnect.setOnClickListener { chatManager.disconnect() }
         buttonSend.setOnClickListener { sendCurrentMessage() }
+        editMessage.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(
+                s: CharSequence?, start: Int, count: Int, after: Int
+            ) {
+            }
+
+            override fun onTextChanged(
+                s: CharSequence?, start: Int, before: Int, count: Int
+            ) {
+                onMessageTextChanged(s?.toString() ?: "")
+            }
+
+            override fun afterTextChanged(s: Editable?) {}
+        })
         buttonMic.setOnClickListener { onMicClicked() }
         buttonFile.setOnClickListener { showAttachMenu(it) }
         buttonCancelQuote.setOnClickListener { clearPendingQuote() }
@@ -799,6 +840,94 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         )
         editMessage.text.clear()
         clearPendingQuote()
+    }
+
+    // ---------- Typing indicator ----------
+
+    /**
+     * The message box changed. While it holds any text, the other
+     * phones hear that we are typing — throttled, so a burst of
+     * keystrokes is one signal and steady typing repeats it every
+     * couple of seconds (each repeat also refreshes the display
+     * on the other side). An emptied box takes the signal back at
+     * once; sending does the same, because [sendCurrentMessage]
+     * clears the box. While nobody is connected the signal simply
+     * goes nowhere and is tried again on the next change.
+     */
+    private fun onMessageTextChanged(text: String) {
+        if (text.isBlank()) {
+            stopTypingSignal()
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        if (!typingSignalSent ||
+            now - lastTypingSignalAt >= TYPING_SIGNAL_THROTTLE_MS
+        ) {
+            if (chatManager.sendTypingSignal(true)) {
+                typingSignalSent = true
+                lastTypingSignalAt = now
+            }
+        }
+    }
+
+    /** Takes our "typing" back, once — see [onMessageTextChanged]. */
+    private fun stopTypingSignal() {
+        if (!typingSignalSent) return
+        typingSignalSent = false
+        chatManager.sendTypingSignal(false)
+    }
+
+    /**
+     * Forgets everyone who was typing (a connection change makes
+     * their state meaningless) and stops the expiry wake-up. The
+     * status line itself is the caller's business: the callbacks
+     * that call this set a fresh status right after.
+     */
+    private fun forgetTypingPeers() {
+        typingPeers.clear()
+        typingHandler.removeCallbacks(typingExpiryCheck)
+    }
+
+    /**
+     * Paints the typing line — or hands the line back to the real
+     * status. Expired typers are pruned first; the one named is
+     * the most recent (a refresh re-inserts at the end of the
+     * map, see onTypingChanged). While anyone is left, a wake-up
+     * is set for the earliest expiry, so the line also clears
+     * itself about three seconds after the last signal when no
+     * stop ever arrives.
+     */
+    private fun refreshTypingIndicator() {
+        val now = SystemClock.uptimeMillis()
+        val iterator = typingPeers.entries.iterator()
+        while (iterator.hasNext()) {
+            if (iterator.next().value <= now) iterator.remove()
+        }
+        typingHandler.removeCallbacks(typingExpiryCheck)
+        if (typingPeers.isEmpty()) {
+            if (typingStatusShown) showRealStatus()
+            return
+        }
+        typingStatusShown = true
+        statusText.text = getString(
+            R.string.typing_indicator, typingPeers.keys.last()
+        )
+        statusText.setTextColor(
+            AppColors.statusColor(this, R.color.status_idle)
+        )
+        val earliest = typingPeers.values.minOrNull() ?: now
+        typingHandler.postDelayed(
+            typingExpiryCheck, maxOf(0L, earliest - now)
+        )
+    }
+
+    /** Puts the status line back to the last real status. */
+    private fun showRealStatus() {
+        typingStatusShown = false
+        statusText.text = currentStatusText
+        statusText.setTextColor(
+            AppColors.statusColor(this, currentStatusColorRes)
+        )
     }
 
     // ---------- Replies & reactions ----------
@@ -1785,9 +1914,19 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
     // ---------- Helpers ----------
 
+    /**
+     * Sets the status line — and remembers it as the line's real
+     * content. A typing line may be borrowing the line when this
+     * is called; a real status always wins it back at once (the
+     * typing state itself is kept until its own timeout — it
+     * just stops being what the line shows), and when the typing
+     * line later ends, [showRealStatus] restores this status,
+     * never an older one.
+     */
     private fun setStatus(text: String, colorRes: Int) {
-        statusText.text = text
-        statusText.setTextColor(AppColors.statusColor(this, colorRes))
+        currentStatusText = text
+        currentStatusColorRes = colorRes
+        showRealStatus()
     }
 
     private fun addMessage(message: ChatMessage) {
@@ -1996,6 +2135,11 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
     override fun onGroupHostUpdate(connectedCount: Int) {
         if (closing) return
+        // The group changed shape: the one who left may be the
+        // one who was typing. Their state is forgotten — a member
+        // who is still typing re-announces within a couple of
+        // seconds anyway.
+        forgetTypingPeers()
         setStatus(
             getString(R.string.status_hosting, connectedCount),
             R.color.status_connected
@@ -2013,6 +2157,12 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         peerTalking = false
         peerTalkingName = null
         refreshWalkieDialog()
+        // Typing states died with the connection too: ours (the
+        // flag resets, so a later reconnect re-announces on the
+        // next keystroke) and theirs (forgotten at once; the
+        // setStatus below repaints the line anyway).
+        typingSignalSent = false
+        forgetTypingPeers()
         setStatus(getString(R.string.status_disconnected), R.color.status_idle)
     }
 
@@ -2259,6 +2409,29 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         refreshWalkieDialog()
     }
 
+    /**
+     * Someone's typing state changed (see [ChatManager]). The
+     * name is the typer's own — in a group it names whoever is
+     * typing, not the host who relayed the signal. A typer
+     * without a name cannot be announced and is ignored, like an
+     * unattributed reaction. The display and its timeout live
+     * in [refreshTypingIndicator].
+     */
+    override fun onTypingChanged(senderName: String?, isTyping: Boolean) {
+        if (closing) return
+        val name = senderName?.takeIf { it.isNotBlank() } ?: return
+        if (isTyping) {
+            // Re-inserted at the end of the map, so the name the
+            // status line shows is the most recent typer.
+            typingPeers.remove(name)
+            typingPeers[name] =
+                SystemClock.uptimeMillis() + TYPING_DISPLAY_MS
+        } else {
+            typingPeers.remove(name)
+        }
+        refreshTypingIndicator()
+    }
+
     override fun onError(message: String) {
         if (closing) return
         requestDialog?.dismiss()
@@ -2288,5 +2461,10 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         // to answer before the next one is tried.
         private const val LOCATION_FRESH_MS = 2 * 60_000L // 2 minutes
         private const val LOCATION_TIMEOUT_MS = 15_000L // 15 seconds
+        // Typing indicator: while the user types, the "typing"
+        // signal repeats at most this often; a peer's indicator
+        // is forgotten this long after their last signal.
+        private const val TYPING_SIGNAL_THROTTLE_MS = 2_000L // 2 seconds
+        private const val TYPING_DISPLAY_MS = 3_000L // 3 seconds
     }
 }

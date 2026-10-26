@@ -109,6 +109,19 @@ import java.util.UUID
  * the talk. It is half-duplex, like a real walkie-talkie: a stream
  * that arrives while we are talking ourselves, or while another
  * talk is already playing, is drained and dropped, never mixed in.
+ *
+ * Typing indicator: while the user types, a tiny "#TYPE#ON#name"
+ * text says so and a "#TYPE#OFF#name" text takes it back (see
+ * [sendTypingSignal]). Unlike the other control texts these do
+ * NOT ride [sendMessage]: they carry no "#ID#" (so they can never
+ * take a slot in the duplicate protection, however often they
+ * repeat), are never tracked for the delivered ticks, and are
+ * never shown or saved anywhere. The typer's name is stamped
+ * into the text itself (as in the file info texts), and the hub
+ * relays the text word for word, so in a group the name still
+ * names the typer, not the hub. A lost signal costs nothing:
+ * the receiving side forgets a typer a few seconds after their
+ * last signal, stop or no stop.
  */
 class ChatManager(
     context: Context,
@@ -228,6 +241,18 @@ class ChatManager(
          * it down.
          */
         fun onOwnTalkEnded() {}
+
+        /**
+         * Someone's typing state changed: the person named
+         * [senderName] (null when the signal carried no name) is
+         * typing when [isTyping] is true and stopped when it is
+         * false. Signals repeat while the person types; one that
+         * is never followed by a stop is best forgotten a few
+         * seconds after the last one (see the class comment).
+         * Display-only: no message exists for this anywhere — it
+         * is never shown as a chat text and never saved.
+         */
+        fun onTypingChanged(senderName: String?, isTyping: Boolean) {}
 
         fun onError(message: String)
 
@@ -427,6 +452,16 @@ class ChatManager(
     // stored here — the host's relays of other people's messages are
     // therefore never reported as deliveries.
     private val outgoingPayloads = mutableMapOf<Long, Long>()
+
+    // Payloads of our own typing signals ("#TYPE#...") that Nearby
+    // has not finished sending yet — ours, and the hub's relays of
+    // other members' signals. A typing signal is invisible and
+    // worthless once late, so its transfer is never reported: not
+    // as a delivery (it is not in [outgoingPayloads]) and not as
+    // an error either — this set is how a finished or failed
+    // typing transfer is recognised in onPayloadTransferUpdate
+    // and quietly forgotten there.
+    private val typingPayloadIds = mutableSetOf<Long>()
 
     // File payloads that arrived and are still being transferred.
     private val incomingFilePayloads = mutableMapOf<Long, Payload>()
@@ -730,6 +765,41 @@ class ChatManager(
     fun sendDeleteMessage(targetWireId: String): Boolean {
         if (targetWireId.isEmpty()) return false
         return sendMessage(DELETE_PREFIX + targetWireId)
+    }
+
+    /**
+     * Tells the connected phones that the user is typing a
+     * message ([isTyping] true) or stopped (false). The signal
+     * is a bare control text — "#TYPE#" + "ON" or "OFF", plus
+     * "#" and this phone's name when it has one — sent as its
+     * own payload, NOT through [sendMessage]: it must not take
+     * a message id (the duplicate protection stays for real
+     * messages, however often the signal repeats), must not
+     * earn delivered ticks, and must never be shown or saved
+     * (see the class comment). The name is stamped in exactly
+     * like a file info text's sender, so the hub's word-for-word
+     * relay keeps naming the typer. There is deliberately no
+     * failure reporting: a signal that cannot be sent is not an
+     * error worth showing, because the other side forgets a
+     * typer on its own after a few seconds anyway (and a failed
+     * transfer is kept quiet via [typingPayloadIds]). Returns
+     * false when nobody is connected.
+     */
+    fun sendTypingSignal(isTyping: Boolean): Boolean {
+        val targets = sendTargets()
+        if (targets.isEmpty()) return false
+        val name = wireSenderName()
+        val text = StringBuilder(TYPING_PREFIX)
+            .append(if (isTyping) "ON" else "OFF")
+        if (name.isNotEmpty()) {
+            text.append('#').append(name)
+        }
+        val payload = Payload.fromBytes(
+            text.toString().toByteArray(Charsets.UTF_8)
+        )
+        typingPayloadIds.add(payload.id)
+        client.sendPayload(targets, payload)
+        return true
     }
 
     // ----- Walkie-talkie (live push-to-talk voice) -----
@@ -1430,6 +1500,7 @@ class ChatManager(
         // Transfers that never finished will never report now; their
         // messages simply keep the single "sent" tick.
         outgoingPayloads.clear()
+        typingPayloadIds.clear()
         // Any live walkie-talkie talk dies with the connection:
         // our capture stops and a playing talk is cut off.
         stopTalkInternal()
@@ -1802,6 +1873,31 @@ class ChatManager(
                         }
                         return
                     }
+                    if (raw.startsWith(TYPING_PREFIX)) {
+                        // A typing signal ("#TYPE#ON#name" /
+                        // "#TYPE#OFF#name"): reported to the
+                        // listener, and relayed by the host below
+                        // like every control text, but never
+                        // unpacked — it carries no message id, so
+                        // it cannot take a slot in the duplicate
+                        // protection, and it is never shown as a
+                        // chat text or saved. A damaged one parses
+                        // to null and is simply dropped here; the
+                        // relay still carries it, so the group
+                        // stays in step.
+                        parseTypingSignal(raw)?.let { (typing, name) ->
+                            listener.onTypingChanged(name, typing)
+                        }
+                        if (role == Role.HUB) {
+                            val targets = sendTargets(exclude = endpointId)
+                            if (targets.isNotEmpty()) {
+                                val relay = Payload.fromBytes(bytes)
+                                typingPayloadIds.add(relay.id)
+                                client.sendPayload(targets, relay)
+                            }
+                        }
+                        return
+                    }
                     if (raw.startsWith(VOICE_PREFIX)) {
                         // Info about the voice file that follows.
                         parseVoiceInfo(raw)?.let {
@@ -1916,6 +2012,10 @@ class ChatManager(
                 // simply never earns the second tick (the error below
                 // is the same feedback as before).
                 outgoingPayloads.remove(update.payloadId)
+                // A failed typing signal is forgotten silently: it
+                // was never a message, so it must not produce the
+                // "could not be transferred" error below either.
+                val wasTyping = typingPayloadIds.remove(update.payloadId)
                 if (wasIncoming) {
                     // The file is gone, so its info message — and any
                     // quote or message id waiting for it — are stale too.
@@ -1923,8 +2023,13 @@ class ChatManager(
                     pendingQuotes.remove(endpointId)
                     pendingWireIds.remove(endpointId)
                 }
-                listener.onError("A message could not be transferred.")
+                if (!wasTyping) {
+                    listener.onError("A message could not be transferred.")
+                }
             } else if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
+                // A typing signal that got through is simply
+                // forgotten; it was never tracked for the ticks.
+                typingPayloadIds.remove(update.payloadId)
                 // One of our own messages finished transferring to the
                 // next phone. In a group send the payload goes to
                 // several phones with one payload id, so the FIRST
@@ -2181,6 +2286,39 @@ class ChatManager(
         val rest = text.substring(DELETE_PREFIX.length)
         if (!isMessageIdShape(rest)) return null
         return rest
+    }
+
+    /**
+     * Reads a typing signal: "#TYPE#" + "ON" or "OFF", plus "#"
+     * and the typer's name when the sender stamped one (the name
+     * itself never contains '#'; [wireSenderName] saw to that).
+     * Returns the typing state and the name (null when no name
+     * rides along). Anything else is null — a control text gone
+     * wrong, dropped silently. The signal is read from the raw
+     * payload, before unpacking, like the file info texts: it
+     * never went through [sendMessage], so there is no message
+     * id to unpack, and a typed chat text (which always carries
+     * an id) can never be taken for one.
+     */
+    private fun parseTypingSignal(raw: String): Pair<Boolean, String?>? {
+        val rest = raw.substring(TYPING_PREFIX.length)
+        val separator = rest.indexOf('#')
+        val state = if (separator >= 0) {
+            rest.substring(0, separator)
+        } else {
+            rest
+        }
+        val isTyping = when (state) {
+            "ON" -> true
+            "OFF" -> false
+            else -> return null
+        }
+        val name = if (separator >= 0) {
+            rest.substring(separator + 1).takeIf { it.isNotEmpty() }
+        } else {
+            null
+        }
+        return isTyping to name
     }
 
     /**
@@ -2582,6 +2720,12 @@ class ChatManager(
         private const val TALK_PREFIX = "#TALK#"
         private const val TALK_START_TEXT = "#TALK#START"
         private const val TALK_END_TEXT = "#TALK#END"
+        // A typing signal, a bare text payload of its own — never
+        // wrapped by sendMessage, so it carries no "#ID#" and is
+        // read from the raw payload like the info texts:
+        // "#TYPE#" + "ON" or "OFF" + "#" + the typer's name
+        // (see sendTypingSignal / parseTypingSignal).
+        private const val TYPING_PREFIX = "#TYPE#"
         // The live voice format: 16 kHz mono PCM16, in chunks of
         // 100 ms — small chunks keep the delay low. A talk is
         // capped like a voice message is (2 minutes), so a stuck
