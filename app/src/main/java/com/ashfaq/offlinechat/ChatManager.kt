@@ -1,6 +1,8 @@
 package com.ashfaq.offlinechat
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -11,6 +13,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.util.Base64
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.AdvertisingOptions
 import com.google.android.gms.nearby.connection.ConnectionInfo
@@ -24,6 +27,7 @@ import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
@@ -122,6 +126,27 @@ import java.util.UUID
  * names the typer, not the hub. A lost signal costs nothing:
  * the receiving side forgets a typer a few seconds after their
  * last signal, stop or no stop.
+ *
+ * Profiles: a phone can carry a small profile — a photo and a
+ * one-line status (see [sendProfile]). It rides a bare control
+ * text of its own, "#PROF#" + name + "#" + status + "#" + the
+ * photo as base64 (a small square JPEG, stepped down in size and
+ * quality until the whole text fits a tight cap), sent exactly
+ * like the typing signals: no message id (no duplicate-protection
+ * slot), no delivered ticks, never shown or saved as a message,
+ * and relayed word for word by the hub, so the name inside keeps
+ * naming the profile's owner rather than the hub. The photo rides
+ * inside the text itself — no file payload — so a profile can
+ * never be paired with, or mistaken for, a chat file. Profiles
+ * are exchanged as soon as a connection stands (a host also
+ * hands a new joiner the profiles it already holds, so the
+ * joiner sees the whole group, not just the host) and again
+ * whenever the user edits theirs while connected. What arrives
+ * is kept per sender name in [peerProfiles] — the status in
+ * memory, the photo as a small file — for the screen to show.
+ * An older app version knows none of this and shows the text as
+ * one long chat message: the same accepted mixed-version cost
+ * as "#TYPE#".
  *
  * Forwarding: there is only ever one conversation on a phone, so
  * "forward" means re-sending an earlier message as a NEW message
@@ -308,6 +333,16 @@ class ChatManager(
          * is never shown as a chat text and never saved.
          */
         fun onTypingChanged(senderName: String?, isTyping: Boolean) {}
+
+        /**
+         * A profile arrived from the person named [senderName]
+         * (see the class comment): their status and photo are
+         * stored with the manager, ready via [peerProfiles].
+         * Display-only bookkeeping — no message exists for this
+         * anywhere: it is never shown as a chat text and never
+         * saved in the chat history.
+         */
+        fun onProfileReceived(senderName: String) {}
 
         fun onError(message: String)
 
@@ -620,6 +655,36 @@ class ChatManager(
     // typing transfer is recognised in onPayloadTransferUpdate
     // and quietly forgotten there.
     private val typingPayloadIds = mutableSetOf<Long>()
+
+    // Payloads of our own profile texts ("#PROF#...") — ours, a
+    // host's hand-over of held profiles to a new joiner, and the
+    // hub's relays. Kept quiet in onPayloadTransferUpdate exactly
+    // like the typing payloads: a profile is a courtesy, so its
+    // failure is not an error worth a status line, and it earns
+    // no delivered tick either.
+    private val profilePayloadIds = mutableSetOf<Long>()
+
+    /**
+     * A profile received from another phone: their wire name (the
+     * key every profile is kept under), their status line ("" when
+     * they have none), the photo exactly as it rode the wire
+     * (base64, "" when they have none — the host keeps it so it
+     * can hand the profile on to a new joiner unchanged) and the
+     * file the photo was written to (null when there is none).
+     */
+    class PeerProfile(
+        val name: String,
+        val status: String,
+        val photoBase64: String,
+        val photoFile: File?
+    )
+
+    // Profiles received from other phones, by their wire name, in
+    // the order they first arrived. Deliberately NOT cleared when
+    // a connection ends: like the friends list, they are this
+    // phone's memory of people it has met, refreshed automatically
+    // on every new connection.
+    private val peerProfiles = LinkedHashMap<String, PeerProfile>()
 
     // File payloads that arrived and are still being transferred.
     private val incomingFilePayloads = mutableMapOf<Long, Payload>()
@@ -1035,6 +1100,223 @@ class ChatManager(
         typingPayloadIds.add(payload.id)
         client.sendPayload(targets, payload)
         return true
+    }
+
+    // ----- Profiles -----
+
+    /** The user's own profile status line ("" when none was set). */
+    fun profileStatus(): String =
+        prefs.getString(KEY_PROFILE_STATUS, null) ?: ""
+
+    /**
+     * Saves a new profile status, cleaned the same way it rides
+     * the wire (see [sanitizeProfileStatus]); blank clears it.
+     * Takes effect on the next [sendProfile] — the screen calls
+     * that right after saving while connected, so the other
+     * phones show the new status without reconnecting.
+     */
+    fun updateProfileStatus(newStatus: String) {
+        val clean = sanitizeProfileStatus(newStatus)
+        val editor = prefs.edit()
+        if (clean.isEmpty()) {
+            editor.remove(KEY_PROFILE_STATUS)
+        } else {
+            editor.putString(KEY_PROFILE_STATUS, clean)
+        }
+        editor.apply()
+    }
+
+    /**
+     * Makes a status safe to ride the wire: '#' is the field
+     * separator of the profile format (and line breaks would break
+     * its one-line layout), so both become spaces, and the status
+     * is capped in length — the same cleaning [wireQuoteField]
+     * gives the quote fields.
+     */
+    private fun sanitizeProfileStatus(raw: String): String =
+        wireQuoteField(raw, MAX_PROFILE_STATUS_LENGTH)
+
+    /**
+     * The file the user's own profile photo is stored in. The
+     * screen writes the picked photo here (square, shrunk — the
+     * wire encoding in [encodeOwnProfilePhoto] shrinks it further
+     * on the way out); [sendProfile] reads it from here.
+     */
+    fun ownProfilePhotoFile(): File =
+        File(File(appContext.filesDir, PROFILE_DIR_NAME), OWN_PROFILE_PHOTO_NAME)
+
+    /** The profile received from the person named [name], if any. */
+    fun peerProfile(name: String): PeerProfile? = peerProfiles[name]
+
+    /** Every profile received so far, in first-arrival order. */
+    fun peerProfiles(): List<PeerProfile> = peerProfiles.values.toList()
+
+    /** True while this phone is hosting a group. */
+    fun isGroupHost(): Boolean = role == Role.HUB
+
+    /**
+     * Sends our profile — name, status and photo — to everyone we
+     * are connected with (see the class comment). The text is a
+     * bare control payload like the typing signals', NOT routed
+     * through [sendMessage], for the same reasons: no message id
+     * slot, no ticks, never shown or saved. Called when a
+     * connection stands and again after the user edits their
+     * profile. Returns false when nobody is connected.
+     */
+    fun sendProfile(): Boolean {
+        val targets = sendTargets()
+        if (targets.isEmpty()) return false
+        return sendProfileText(
+            profileWireText(
+                wireSenderName(),
+                sanitizeProfileStatus(profileStatus()),
+                encodeOwnProfilePhoto()
+            ),
+            targets
+        )
+    }
+
+    /** One profile text: "#PROF#" + name + "#" + status + "#" + photo. */
+    private fun profileWireText(
+        name: String,
+        status: String,
+        photoBase64: String
+    ): String =
+        PROFILE_PREFIX + name + "#" + status + "#" + photoBase64
+
+    /**
+     * Sends one already-built profile text to [targets], keeping
+     * its transfer quiet via [profilePayloadIds]. Used for our
+     * own profile, for the host's relays, and for the host handing
+     * the profiles it holds to a new joiner (the text is rebuilt
+     * from the stored parts, so the name inside still names the
+     * profile's owner, not the host).
+     */
+    private fun sendProfileText(text: String, targets: List<String>): Boolean {
+        if (targets.isEmpty()) return false
+        val payload = Payload.fromBytes(text.toByteArray(Charsets.UTF_8))
+        profilePayloadIds.add(payload.id)
+        client.sendPayload(targets, payload)
+        return true
+    }
+
+    /**
+     * Our profile photo as base64, small enough to ride inside
+     * the profile text: the stored photo is centre-cropped to a
+     * square, then encoded as a JPEG stepped down in size and
+     * quality until the WHOLE profile text fits
+     * [MAX_PROFILE_PAYLOAD_CHARS]. "" when there is no usable
+     * photo — and in the (practically impossible) case that even
+     * the smallest encoding is too big, so what goes out is a
+     * status-only profile rather than an oversized payload.
+     */
+    private fun encodeOwnProfilePhoto(): String {
+        val file = ownProfilePhotoFile()
+        if (!file.isFile || file.length() == 0L) return ""
+        val decoded = BitmapFactory.decodeFile(file.absolutePath) ?: return ""
+        val side = minOf(decoded.width, decoded.height)
+        val square = Bitmap.createBitmap(
+            decoded,
+            (decoded.width - side) / 2,
+            (decoded.height - side) / 2,
+            side,
+            side
+        )
+        if (square !== decoded) decoded.recycle()
+        // Every fixed character of the profile text besides the
+        // photo itself: the prefix, the name, the status and the
+        // two '#' separators.
+        val overhead = PROFILE_PREFIX.length + wireSenderName().length +
+            sanitizeProfileStatus(profileStatus()).length + 2
+        for (size in PROFILE_PHOTO_SIZES) {
+            val scaled = Bitmap.createScaledBitmap(square, size, size, true)
+            for (quality in PROFILE_JPEG_QUALITIES) {
+                val stream = ByteArrayOutputStream()
+                if (!scaled.compress(Bitmap.CompressFormat.JPEG, quality, stream)) {
+                    continue
+                }
+                val encoded = Base64.encodeToString(
+                    stream.toByteArray(), Base64.NO_WRAP
+                )
+                if (overhead + encoded.length <= MAX_PROFILE_PAYLOAD_CHARS) {
+                    if (scaled !== square) scaled.recycle()
+                    square.recycle()
+                    return encoded
+                }
+            }
+            if (scaled !== square) scaled.recycle()
+        }
+        square.recycle()
+        return ""
+    }
+
+    /**
+     * Reads a profile text: "#PROF#" + name + "#" + status + "#" +
+     * base64 photo. None of the three fields can contain '#'
+     * (the name and status are cleaned on the sending side, the
+     * base64 alphabet has no '#'), so the split is unambiguous.
+     * Returns the name, the status and the decoded photo bytes
+     * (null when no photo rides along). Anything malformed — no
+     * name, the wrong number of fields, photo bytes that are not
+     * base64, or a text longer than any sender of this version
+     * would build — is null: a control text gone wrong, dropped
+     * silently like the other control texts.
+     */
+    private fun parseProfileText(raw: String): Triple<String, String, ByteArray?>? {
+        if (raw.length > MAX_PROFILE_PAYLOAD_CHARS) return null
+        val parts = raw.substring(PROFILE_PREFIX.length).split('#')
+        if (parts.size != 3) return null
+        val name = parts[0]
+        if (name.isEmpty() || name.length > MAX_PROFILE_NAME_LENGTH) return null
+        val status = parts[1].take(MAX_PROFILE_STATUS_LENGTH)
+        val photoPart = parts[2]
+        val photoBytes = if (photoPart.isEmpty()) {
+            null
+        } else {
+            try {
+                Base64.decode(photoPart, Base64.NO_WRAP)
+            } catch (e: IllegalArgumentException) {
+                return null
+            }
+        }
+        return Triple(name, status, photoBytes)
+    }
+
+    /**
+     * Keeps a received profile: the photo bytes become the file
+     * the screen shows (a profile that arrives without a photo
+     * clears the file an earlier one left), and the entry is
+     * (re-)inserted at the end of [peerProfiles] — most recent
+     * last, like the typing map. The stored base64 is re-encoded
+     * from the bytes, so what the host later hands to a new
+     * joiner is the canonical form of exactly what arrived.
+     */
+    private fun storePeerProfile(name: String, status: String, photoBytes: ByteArray?) {
+        var photoFile: File? = null
+        var photoBase64 = ""
+        val file = peerProfilePhotoFile(name)
+        if (photoBytes != null && photoBytes.isNotEmpty()) {
+            photoBase64 = Base64.encodeToString(photoBytes, Base64.NO_WRAP)
+            try {
+                file.parentFile?.mkdirs()
+                file.writeBytes(photoBytes)
+                photoFile = file
+            } catch (e: Exception) {
+                photoFile = null
+            }
+        } else {
+            file.delete()
+        }
+        peerProfiles.remove(name)
+        peerProfiles[name] = PeerProfile(name, status, photoBase64, photoFile)
+    }
+
+    /** Where the photo of the profile named [name] is kept. */
+    private fun peerProfilePhotoFile(name: String): File {
+        val base = sanitizeFileName(name).ifEmpty { "peer" }
+        return File(
+            File(appContext.filesDir, PEER_PROFILES_DIR_NAME), "$base.jpg"
+        )
     }
 
     // ----- Walkie-talkie (live push-to-talk voice) -----
@@ -1769,6 +2051,7 @@ class ChatManager(
         outgoingPayloads.clear()
         outgoingFilePayloads.clear()
         typingPayloadIds.clear()
+        profilePayloadIds.clear()
         // Any live walkie-talkie talk dies with the connection:
         // our capture stops and a playing talk is cut off.
         stopTalkInternal()
@@ -2026,6 +2309,27 @@ class ChatManager(
                     client.stopDiscovery()
                     listener.onConnected(name)
                 }
+                // Profiles are exchanged as soon as a connection
+                // stands (see the class comment): ours goes to
+                // everyone we are now connected with — for the host
+                // that includes the phone that just joined — and a
+                // host also hands the joiner the profiles it already
+                // holds, rebuilt from the stored parts so the name
+                // inside keeps naming each profile's owner, so the
+                // joiner sees the whole group and not just the host.
+                sendProfile()
+                if (role == Role.HUB) {
+                    for (profile in peerProfiles.values) {
+                        sendProfileText(
+                            profileWireText(
+                                profile.name,
+                                profile.status,
+                                profile.photoBase64
+                            ),
+                            listOf(endpointId)
+                        )
+                    }
+                }
             } else if (roleBefore == Role.HUB) {
                 // One join did not work out; the group carries on.
             } else if (code == ConnectionsStatusCodes.STATUS_CONNECTION_REJECTED) {
@@ -2216,6 +2520,32 @@ class ChatManager(
                         }
                         return
                     }
+                    if (raw.startsWith(PROFILE_PREFIX)) {
+                        // A profile ("#PROF#name#status#base64
+                        // photo"): stored with the manager and
+                        // reported to the listener, and relayed by
+                        // the host below like the typing signals,
+                        // but never unpacked — it carries no message
+                        // id, is never shown as a chat text and
+                        // never reaches the history. A damaged or
+                        // oversized one parses to null and is simply
+                        // dropped here; the relay still carries it,
+                        // so the group stays in step and every phone
+                        // judges for itself.
+                        parseProfileText(raw)?.let { (name, status, photoBytes) ->
+                            storePeerProfile(name, status, photoBytes)
+                            listener.onProfileReceived(name)
+                        }
+                        if (role == Role.HUB) {
+                            val targets = sendTargets(exclude = endpointId)
+                            if (targets.isNotEmpty()) {
+                                val relay = Payload.fromBytes(bytes)
+                                profilePayloadIds.add(relay.id)
+                                client.sendPayload(targets, relay)
+                            }
+                        }
+                        return
+                    }
                     if (raw.startsWith(VOICE_PREFIX)) {
                         // Info about the voice file that follows.
                         parseVoiceInfo(raw)?.let {
@@ -2382,6 +2712,9 @@ class ChatManager(
                 // was never a message, so it must not produce the
                 // "could not be transferred" error below either.
                 val wasTyping = typingPayloadIds.remove(update.payloadId)
+                // The same quiet forgetting for a profile text:
+                // it was never a message either.
+                val wasProfile = profilePayloadIds.remove(update.payloadId)
                 if (wasIncoming) {
                     // The file is gone, so its info message — and any
                     // quote or message id waiting for it — are stale too.
@@ -2397,13 +2730,16 @@ class ChatManager(
                 if (incomingProgressPayloads.remove(update.payloadId) != null) {
                     listener.onReceiveFailed(update.payloadId)
                 }
-                if (failed && !wasTyping) {
+                if (failed && !wasTyping && !wasProfile) {
                     listener.onError("A message could not be transferred.")
                 }
             } else if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
                 // A typing signal that got through is simply
                 // forgotten; it was never tracked for the ticks.
                 typingPayloadIds.remove(update.payloadId)
+                // A profile text that got through is forgotten the
+                // same way.
+                profilePayloadIds.remove(update.payloadId)
                 // One of our own file sends got through (to the first
                 // phone, in a group); the delivered tick below is
                 // what ends its progress bar, so it leaves the
@@ -3257,6 +3593,29 @@ class ChatManager(
         // "#TYPE#" + "ON" or "OFF" + "#" + the typer's name
         // (see sendTypingSignal / parseTypingSignal).
         private const val TYPING_PREFIX = "#TYPE#"
+        // A profile, a bare text payload of its own like the
+        // typing signal — never wrapped by sendMessage, so it
+        // carries no "#ID#" and is read from the raw payload:
+        // "#PROF#" + name + "#" + status + "#" + the photo as
+        // base64 ("" when there is none) — see sendProfile /
+        // parseProfileText. The whole text is built to fit
+        // MAX_PROFILE_PAYLOAD_CHARS, name and status included.
+        private const val PROFILE_PREFIX = "#PROF#"
+        private const val KEY_PROFILE_STATUS = "profile_status"
+        private const val MAX_PROFILE_STATUS_LENGTH = 60
+        private const val MAX_PROFILE_NAME_LENGTH = 100
+        private const val MAX_PROFILE_PAYLOAD_CHARS = 24 * 1024
+        // Our own profile photo lives in filesDir/profile/; the
+        // photos received with other phones' profiles live in
+        // filesDir/profiles/, one file per sender name.
+        private const val PROFILE_DIR_NAME = "profile"
+        private const val PEER_PROFILES_DIR_NAME = "profiles"
+        private const val OWN_PROFILE_PHOTO_NAME = "my_photo.jpg"
+        // The wire photo's step-down ladder: square sizes and
+        // JPEG qualities, biggest first; the first pair whose
+        // encoding fits the payload cap wins.
+        private val PROFILE_PHOTO_SIZES = intArrayOf(192, 144, 96, 64)
+        private val PROFILE_JPEG_QUALITIES = intArrayOf(70, 55, 40)
         // The live voice format: 16 kHz mono PCM16, in chunks of
         // 100 ms — small chunks keep the delay low. A talk is
         // capped like a voice message is (2 minutes), so a stuck

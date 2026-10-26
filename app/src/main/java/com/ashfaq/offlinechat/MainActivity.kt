@@ -8,7 +8,10 @@ import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Typeface
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -26,6 +29,7 @@ import android.text.Editable
 import android.text.InputFilter
 import android.text.InputType
 import android.text.TextWatcher
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -33,8 +37,10 @@ import android.view.inputmethod.InputMethodManager
 import android.webkit.MimeTypeMap
 import android.widget.EditText
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
@@ -56,6 +62,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
 
     private lateinit var chatManager: ChatManager
     private lateinit var adapter: MessageAdapter
+    private lateinit var titleText: TextView
     private lateinit var statusText: TextView
     private lateinit var recyclerMessages: RecyclerView
     private lateinit var editMessage: EditText
@@ -234,6 +241,19 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     private var currentStatusColorRes: Int = R.color.status_idle
     private var typingStatusShown = false
 
+    // Profile state (Update #21). The endpoint name of the phone
+    // we are connected with one-to-one, remembered so the profile
+    // dialog can still name the person before their profile has
+    // arrived (or when their app is too old to send one). And the
+    // own-profile dialog's working parts: the photo preview inside
+    // it (non-null only while the dialog is open) and a newly
+    // picked photo staged in the cache — it only becomes the real
+    // profile photo when the dialog's Save is pressed; dismissing
+    // the dialog throws it away again.
+    private var connectedPeerName: String? = null
+    private var profilePhotoPreview: ImageView? = null
+    private var pendingProfilePhotoFile: File? = null
+
     // Waiting-for-a-fix state: the manager and listener of the one
     // single update that may be in flight, and the providers still
     // left to try when it times out. All null/empty when idle.
@@ -313,12 +333,27 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         }
     }
 
+    // The profile photo picker (Update #21): a single image from
+    // the gallery, through the same permission-free system picker
+    // as chat photos — but a DEDICATED launcher, because a pick
+    // here is never sent as a chat photo: it is staged for the
+    // profile dialog (see stageOwnProfilePhoto). A cancelled pick
+    // stays silent.
+    private val profilePhotoLauncher = registerForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null && !closing) {
+            stageOwnProfilePhoto(uri)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Version 1 stays in portrait so a rotation cannot drop the connection.
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         setContentView(R.layout.activity_main)
 
+        titleText = findViewById(R.id.titleText)
         statusText = findViewById(R.id.statusText)
         recyclerMessages = findViewById(R.id.recyclerMessages)
         editMessage = findViewById(R.id.editMessage)
@@ -424,6 +459,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         buttonCancelQuote.setOnClickListener { clearPendingQuote() }
         buttonSearch.setOnClickListener { toggleSearchBar() }
         buttonOverflow.setOnClickListener { showOverflowMenu(it) }
+        titleText.setOnClickListener { showPeerProfileDialog() }
         buttonCloseSearch.setOnClickListener { closeSearch() }
         editSearch.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(
@@ -467,7 +503,8 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
      * Name, Friends, dark mode, PIN lock, color themes, Clear chat —
      * lives here now, each item calling the very same handler or
      * dialog its old button called. The Walkie-Talkie item (update
-     * #14) opens its own dialog, described below.
+     * #14) opens its own dialog, described below; the Profile item
+     * (update #21) opens the own-profile dialog further down.
      */
     private fun showOverflowMenu(anchor: View) {
         val itemName = 1
@@ -477,17 +514,20 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         val itemThemes = 5
         val itemClear = 6
         val itemWalkie = 7
+        val itemProfile = 8
         val popup = PopupMenu(this, anchor)
         popup.menu.add(0, itemName, 0, R.string.your_name)
-        popup.menu.add(0, itemFriends, 1, R.string.friends)
-        popup.menu.add(0, itemDarkMode, 2, R.string.dark_mode)
-        popup.menu.add(0, itemPinLock, 3, R.string.pin_lock_title)
-        popup.menu.add(0, itemThemes, 4, R.string.color_themes)
-        popup.menu.add(0, itemWalkie, 5, R.string.walkie_talkie)
-        popup.menu.add(0, itemClear, 6, R.string.clear_chat)
+        popup.menu.add(0, itemProfile, 1, R.string.profile)
+        popup.menu.add(0, itemFriends, 2, R.string.friends)
+        popup.menu.add(0, itemDarkMode, 3, R.string.dark_mode)
+        popup.menu.add(0, itemPinLock, 4, R.string.pin_lock_title)
+        popup.menu.add(0, itemThemes, 5, R.string.color_themes)
+        popup.menu.add(0, itemWalkie, 6, R.string.walkie_talkie)
+        popup.menu.add(0, itemClear, 7, R.string.clear_chat)
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 itemName -> showNameDialog()
+                itemProfile -> showOwnProfileDialog()
                 itemFriends -> showFriendsDialog()
                 itemDarkMode -> toggleDarkMode()
                 itemPinLock -> showPinLockMenu()
@@ -2527,6 +2567,430 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
             .show()
     }
 
+    // ---------- Profiles (Update #21) ----------
+
+    /**
+     * The Profile overflow-menu item: our own photo, name and
+     * status. Tapping the photo picks a new one from the gallery,
+     * staged in the cache until Save — dismissing the dialog
+     * throws the pick away again. The status is a one-line field,
+     * capped at the wire format's length. Save stores both and —
+     * while connected — sends the profile at once (see
+     * [ChatManager.sendProfile]), so the other phones update
+     * without reconnecting. The name is display-only here; it is
+     * edited through the Name item, as before. Built in code, in
+     * the display-name dialog's shape, so it keeps the light
+     * dialog theme like the app's other dialogs.
+     */
+    private fun showOwnProfileDialog() {
+        if (closing) return
+        val density = resources.displayMetrics.density
+        val side = (20 * density).toInt()
+        val sizePx = (PROFILE_PREVIEW_SIZE_DP * density).toInt()
+
+        val photoView = profileImageView(
+            chatManager.displayBaseName(), null, PROFILE_PREVIEW_SIZE_DP
+        )
+        photoView.layoutParams = LinearLayout.LayoutParams(sizePx, sizePx).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            bottomMargin = (6 * density).toInt()
+        }
+        photoView.setOnClickListener {
+            profilePhotoLauncher.launch(
+                PickVisualMediaRequest(
+                    ActivityResultContracts.PickVisualMedia.ImageOnly
+                )
+            )
+        }
+        profilePhotoPreview = photoView
+
+        val photoHint = TextView(this).apply {
+            text = getString(R.string.profile_photo_hint)
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTextColor(
+                ContextCompat.getColor(this@MainActivity, R.color.text_secondary)
+            )
+        }
+        val nameView = TextView(this).apply {
+            text = chatManager.displayBaseName()
+            textSize = 18f
+            gravity = Gravity.CENTER
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(
+                ContextCompat.getColor(this@MainActivity, R.color.text_primary)
+            )
+            setPadding(0, (10 * density).toInt(), 0, (10 * density).toInt())
+        }
+        val statusInput = EditText(this).apply {
+            setText(chatManager.profileStatus())
+            setSelection(text.length)
+            setSingleLine(true)
+            hint = getString(R.string.profile_status_hint)
+            filters = arrayOf(InputFilter.LengthFilter(MAX_PROFILE_STATUS_CHARS))
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(side, (16 * density).toInt(), side, 0)
+            addView(photoView)
+            addView(photoHint)
+            addView(nameView)
+            addView(statusInput)
+        }
+        refreshProfilePhotoPreview()
+        AlertDialog.Builder(this)
+            .setTitle(R.string.profile_title)
+            .setView(container)
+            .setPositiveButton(R.string.save) { _, _ ->
+                // A staged photo pick becomes the real profile
+                // photo only now, on Save.
+                val staged = pendingProfilePhotoFile
+                if (staged != null) {
+                    val target = chatManager.ownProfilePhotoFile()
+                    try {
+                        target.parentFile?.mkdirs()
+                        staged.copyTo(target, overwrite = true)
+                    } catch (e: Exception) {
+                        // The old photo simply stays in place.
+                    }
+                    staged.delete()
+                    pendingProfilePhotoFile = null
+                }
+                chatManager.updateProfileStatus(statusInput.text.toString())
+                // Sent right away when connected, so the other
+                // phones show the new profile without waiting for
+                // a reconnect; with no connection it goes out at
+                // the next one instead (sendProfile just returns).
+                chatManager.sendProfile()
+                Toast.makeText(
+                    this, R.string.profile_saved, Toast.LENGTH_SHORT
+                ).show()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .setOnDismissListener {
+                profilePhotoPreview = null
+                pendingProfilePhotoFile?.delete()
+                pendingProfilePhotoFile = null
+            }
+            .show()
+    }
+
+    /** Repaints the own-profile dialog's photo preview from the
+     *  staged pick when there is one, else from the stored photo. */
+    private fun refreshProfilePhotoPreview() {
+        val view = profilePhotoPreview ?: return
+        val source = pendingProfilePhotoFile
+            ?: chatManager.ownProfilePhotoFile()
+        val sizePx = (PROFILE_PREVIEW_SIZE_DP * resources.displayMetrics.density)
+            .toInt()
+        view.setImageBitmap(
+            profileBitmapFor(chatManager.displayBaseName(), source, sizePx)
+        )
+    }
+
+    /**
+     * A photo picked for the profile: it is processed (turned the
+     * right way up, centre-cropped square, shrunk) and written to
+     * a staging file in the cache — NOT over the real profile
+     * photo, which only the dialog's Save may replace. The preview
+     * in the open dialog shows the staged photo at once.
+     */
+    private fun stageOwnProfilePhoto(uri: Uri) {
+        val bitmap = try {
+            createProfilePhotoBitmap(uri)
+        } catch (e: Exception) {
+            null
+        }
+        if (bitmap == null) {
+            Toast.makeText(
+                this, R.string.profile_photo_failed, Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        val staged = File(cacheDir, "profile_pending.jpg")
+        val saved = try {
+            staged.outputStream().use { output ->
+                bitmap.compress(
+                    Bitmap.CompressFormat.JPEG,
+                    PROFILE_PHOTO_JPEG_QUALITY,
+                    output
+                )
+            }
+        } catch (e: Exception) {
+            false
+        }
+        bitmap.recycle()
+        if (!saved || !staged.exists() || staged.length() == 0L) {
+            staged.delete()
+            Toast.makeText(
+                this, R.string.profile_photo_failed, Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        pendingProfilePhotoFile = staged
+        refreshProfilePhotoPreview()
+    }
+
+    /**
+     * Loads a picked photo for use as the profile picture: bounds
+     * first, a sampled decode, the EXIF turn, a centre-crop to a
+     * square, and a shrink to [PROFILE_PHOTO_STORE_SIZE] — the
+     * chat-photo preparation's shape, minus the file writing (the
+     * caller decides where the bitmap goes). Null when the pick
+     * cannot be read as a picture at all.
+     */
+    private fun createProfilePhotoBitmap(uri: Uri): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, bounds)
+        } ?: return null
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = calculateInSampleSize(
+                bounds.outWidth, bounds.outHeight,
+                PROFILE_PHOTO_STORE_SIZE * 2, PROFILE_PHOTO_STORE_SIZE * 2
+            )
+        }
+        var bitmap = contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, decodeOptions)
+        } ?: return null
+
+        val rotationDegrees = readExifRotationDegrees(uri)
+        if (rotationDegrees != 0) {
+            val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+            val rotated = Bitmap.createBitmap(
+                bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
+            )
+            if (rotated !== bitmap) {
+                bitmap.recycle()
+                bitmap = rotated
+            }
+        }
+
+        val side = minOf(bitmap.width, bitmap.height)
+        val square = Bitmap.createBitmap(
+            bitmap,
+            (bitmap.width - side) / 2,
+            (bitmap.height - side) / 2,
+            side,
+            side
+        )
+        if (square !== bitmap) {
+            bitmap.recycle()
+            bitmap = square
+        }
+        if (side > PROFILE_PHOTO_STORE_SIZE) {
+            val scaled = Bitmap.createScaledBitmap(
+                bitmap,
+                PROFILE_PHOTO_STORE_SIZE,
+                PROFILE_PHOTO_STORE_SIZE,
+                true
+            )
+            if (scaled !== bitmap) {
+                bitmap.recycle()
+                bitmap = scaled
+            }
+        }
+        return bitmap
+    }
+
+    /**
+     * Tapping the header title: who is on the other side? In a
+     * group (or as its host) a list of everyone whose profile this
+     * phone holds — ourselves first — otherwise the one connected
+     * person's profile, big. A peer whose profile has not arrived
+     * (yet, or their app is too old to send one) is named with a
+     * "no status" placeholder; with nobody connected and nothing
+     * held, a toast says so instead of an empty dialog.
+     */
+    private fun showPeerProfileDialog() {
+        if (closing) return
+        val peers = chatManager.peerProfiles()
+        val peerName = connectedPeerName
+        when {
+            peers.size > 1 || (peers.isNotEmpty() && chatManager.isGroupHost()) ->
+                showProfilesListDialog(peers)
+            peers.size == 1 -> {
+                val peer = peers[0]
+                AlertDialog.Builder(this)
+                    .setTitle(R.string.profile_title)
+                    .setView(
+                        profileDetailView(peer.name, peer.status, peer.photoFile)
+                    )
+                    .setPositiveButton(android.R.string.ok, null)
+                    .show()
+            }
+            peerName != null ->
+                AlertDialog.Builder(this)
+                    .setTitle(R.string.profile_title)
+                    .setView(profileDetailView(peerName, "", null))
+                    .setPositiveButton(android.R.string.ok, null)
+                    .show()
+            else -> Toast.makeText(
+                this, R.string.profile_not_connected, Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    /** The group profile list: our own row first, then everyone's. */
+    private fun showProfilesListDialog(peers: List<ChatManager.PeerProfile>) {
+        val density = resources.displayMetrics.density
+        val side = (20 * density).toInt()
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(side, (8 * density).toInt(), side, 0)
+        }
+        val ownFile = chatManager.ownProfilePhotoFile()
+        list.addView(
+            profileRowView(
+                getString(R.string.profile_you, chatManager.displayBaseName()),
+                chatManager.profileStatus(),
+                ownFile.takeIf { it.isFile && it.length() > 0 }
+            )
+        )
+        for (peer in peers) {
+            list.addView(profileRowView(peer.name, peer.status, peer.photoFile))
+        }
+        val scroll = ScrollView(this).apply { addView(list) }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.profiles_title)
+            .setView(scroll)
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
+    }
+
+    /** One person's profile, big: photo (or initial), name, status. */
+    private fun profileDetailView(
+        name: String,
+        status: String,
+        photoFile: File?
+    ): View {
+        val density = resources.displayMetrics.density
+        val side = (20 * density).toInt()
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(side, (16 * density).toInt(), side, 0)
+        }
+        container.addView(profileImageView(name, photoFile, PROFILE_PREVIEW_SIZE_DP))
+        container.addView(TextView(this).apply {
+            text = name
+            textSize = 18f
+            gravity = Gravity.CENTER
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(
+                ContextCompat.getColor(this@MainActivity, R.color.text_primary)
+            )
+            setPadding(0, (10 * density).toInt(), 0, 0)
+        })
+        container.addView(TextView(this).apply {
+            text = status.ifEmpty { getString(R.string.profile_no_status) }
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTextColor(
+                ContextCompat.getColor(this@MainActivity, R.color.text_secondary)
+            )
+            setPadding(0, (4 * density).toInt(), 0, 0)
+        })
+        return container
+    }
+
+    /** One row of the group profile list: small photo, name, status. */
+    private fun profileRowView(
+        name: String,
+        status: String,
+        photoFile: File?
+    ): View {
+        val density = resources.displayMetrics.density
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, (6 * density).toInt(), 0, (6 * density).toInt())
+        }
+        row.addView(profileImageView(name, photoFile, 48))
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+            ).apply {
+                marginStart = (12 * density).toInt()
+            }
+        }
+        texts.addView(TextView(this).apply {
+            text = name
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(
+                ContextCompat.getColor(this@MainActivity, R.color.text_primary)
+            )
+        })
+        texts.addView(TextView(this).apply {
+            text = status.ifEmpty { getString(R.string.profile_no_status) }
+            textSize = 14f
+            setTextColor(
+                ContextCompat.getColor(this@MainActivity, R.color.text_secondary)
+            )
+        })
+        row.addView(texts)
+        return row
+    }
+
+    /** A square ImageView showing the photo in [photoFile], or the
+     *  initial placeholder when there is none. */
+    private fun profileImageView(
+        name: String,
+        photoFile: File?,
+        sizeDp: Int
+    ): ImageView {
+        val sizePx = (sizeDp * resources.displayMetrics.density).toInt()
+        return ImageView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(sizePx, sizePx)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setImageBitmap(profileBitmapFor(name, photoFile, sizePx))
+            contentDescription = name
+        }
+    }
+
+    /** The bitmap a profile view shows: the decoded photo when the
+     *  file holds one, the initial placeholder otherwise. */
+    private fun profileBitmapFor(
+        name: String,
+        photoFile: File?,
+        sizePx: Int
+    ): Bitmap {
+        val decoded = if (
+            photoFile != null && photoFile.isFile && photoFile.length() > 0
+        ) {
+            BitmapFactory.decodeFile(photoFile.absolutePath)
+        } else {
+            null
+        }
+        return decoded ?: initialPlaceholderBitmap(name, sizePx)
+    }
+
+    /**
+     * The stand-in shown where a profile photo would go when a
+     * person has none: a filled circle in the primary colour with
+     * their initial, drawn once into a bitmap (the profile views
+     * are plain ImageViews, so the letter has to be pixels).
+     */
+    private fun initialPlaceholderBitmap(name: String, sizePx: Int): Bitmap {
+        val bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.color = ContextCompat.getColor(this, R.color.primary)
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, sizePx / 2f, paint)
+        paint.color = ContextCompat.getColor(this, R.color.on_primary)
+        paint.textAlign = Paint.Align.CENTER
+        paint.textSize = sizePx * 0.42f
+        val letter = name.trim().firstOrNull()
+            ?.uppercaseChar()?.toString() ?: "?"
+        val baseline = sizePx / 2f - (paint.descent() + paint.ascent()) / 2f
+        canvas.drawText(letter, sizePx / 2f, baseline, paint)
+        return bitmap
+    }
+
     // ---------- PIN lock ----------
 
     /**
@@ -2669,6 +3133,9 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     override fun onConnected(endpointName: String) {
         if (closing) return
         requestDialog?.dismiss()
+        // Remembered for the profile dialog, which can name the
+        // person even before their profile has arrived.
+        connectedPeerName = endpointName
         setStatus(getString(R.string.status_connected, endpointName), R.color.status_connected)
     }
 
@@ -2688,6 +3155,7 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
     override fun onDisconnected() {
         if (closing) return
         requestDialog?.dismiss()
+        connectedPeerName = null
         // Transfers died with the connection: a "receiving"
         // placeholder can never be filled now, so its row goes away
         // (ChatManager also ends each one through onReceiveFailed —
@@ -3193,5 +3661,14 @@ class MainActivity : AppCompatActivity(), ChatManager.Listener {
         // is forgotten this long after their last signal.
         private const val TYPING_SIGNAL_THROTTLE_MS = 2_000L // 2 seconds
         private const val TYPING_DISPLAY_MS = 3_000L // 3 seconds
+        // Profiles (Update #21): the stored own photo is a square
+        // of at most this many pixels (the wire encoding in
+        // ChatManager shrinks it further); the status field allows
+        // as many characters as the wire format does; the dialogs
+        // show photos at this size.
+        private const val PROFILE_PHOTO_STORE_SIZE = 512 // pixels
+        private const val PROFILE_PHOTO_JPEG_QUALITY = 85
+        private const val MAX_PROFILE_STATUS_CHARS = 60
+        private const val PROFILE_PREVIEW_SIZE_DP = 120
     }
 }

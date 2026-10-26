@@ -140,6 +140,17 @@
 
 <string name="typing_indicator">%1$s is typing…</string>
 
+<string name="profile">Profile</string>
+<string name="profile_title">Profile</string>
+<string name="profiles_title">Profiles</string>
+<string name="profile_status_hint">Your status (about line)</string>
+<string name="profile_photo_hint">Tap the photo to change it</string>
+<string name="profile_saved">Profile saved</string>
+<string name="profile_no_status">No status yet</string>
+<string name="profile_not_connected">Connect with someone first to see their profile.</string>
+<string name="profile_you">%1$s (You)</string>
+<string name="profile_photo_failed">That photo could not be used. Please pick another.</string>
+
 <string name="color_themes">Color theme</string>
 <string name="theme_ocean">Ocean</string>
 <string name="theme_forest">Forest</string>
